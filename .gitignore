@@ -28,4 +28,9 @@ IPL.csv
 # Data files
 *.db
 *.csv
-standings.json
+
+archive
+
+ipl.db
+*.pkl
+models/

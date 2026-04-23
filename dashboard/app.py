@@ -1006,14 +1006,18 @@ header[data-testid="stHeader"] svg {
 
 @st.cache_data(ttl=300)
 def load_sim_results():
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        return pd.read_sql("SELECT * FROM simulation_results ORDER BY run_at DESC LIMIT 30", conn)
-    except Exception:
-        return pd.DataFrame()
-    finally:
-        conn.close()
+    path = Path("probabilities.json")
 
+    if not path.exists():
+        return pd.DataFrame()
+
+    data = json.load(open(path))
+
+    return pd.DataFrame([{
+        "results_json": json.dumps(data),
+        "run_at": datetime.utcnow().isoformat(),
+        "n_simulations": 10000
+    }])
 
 @st.cache_data(ttl=300)
 def load_points_table():
