@@ -24,3 +24,8 @@ test.db
 
 
 IPL.csv
+
+# Data files
+*.db
+*.csv
+standings.json
