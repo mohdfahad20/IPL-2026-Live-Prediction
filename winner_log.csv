@@ -1,4 +1,0 @@
-logged_at,run_id,matches_played,matches_remaining,n_simulations,predicted_winner,win_probability,top3_json
-2026-04-22T07:27:18.962542,20260422_072501,30,40,10000,Punjab Kings,0.3088,"{""Punjab Kings"": 0.3088, ""Royal Challengers Bengaluru"": 0.1645, ""Rajasthan Royals"": 0.1563}"
-2026-04-22T07:29:45.766622,20260422_072501,30,40,10000,Punjab Kings,0.3088,"{""Punjab Kings"": 0.3088, ""Royal Challengers Bengaluru"": 0.1645, ""Rajasthan Royals"": 0.1563}"
-2026-04-22T07:32:52.441390,20260422_072501,30,40,10000,Punjab Kings,0.3088,"{""Punjab Kings"": 0.3088, ""Royal Challengers Bengaluru"": 0.1645, ""Rajasthan Royals"": 0.1563}"
