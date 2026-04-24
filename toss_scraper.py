@@ -167,6 +167,8 @@ def get_match_details(match_url: str) -> dict | None:
 
     toss_patterns = [
         r"([A-Za-z ]+?) won the toss and (?:opt(?:ed)? to|elected to) (bat|bowl|field)",
+        r"([A-Za-z ]+?) won the toss.*?(bat|bowl|field)",
+        r"([A-Za-z ]+?) opt(?:ed)? to (bat|bowl|field).*?after winning the toss",
         r"Toss[:\s]+([A-Za-z ]+?),\s*(batting|bowling|fielding)",
     ]
     for pat in toss_patterns:
@@ -174,7 +176,11 @@ def get_match_details(match_url: str) -> dict | None:
         if m:
             toss_winner   = norm(m.group(1).strip())
             raw_decision  = m.group(2).strip().lower()
-            toss_decision = "field" if raw_decision in ("bowl", "bowling", "fielding") else "bat"
+            # toss_decision = "field" if raw_decision in ("bowl", "bowling", "fielding") else "bat"
+            if raw_decision in ("bowl", "bowling", "field", "fielding"):
+                toss_decision = "field"
+            else:
+                toss_decision = "bat"
             break
 
     # Also try the specific Cricbuzz toss div
@@ -225,9 +231,19 @@ def get_match_details(match_url: str) -> dict | None:
 #     log.error("Toss not found after max retries.")
 #     return None
 
-def wait_for_toss(match_url: str) -> dict | None:
-    log.info("Checking toss once (fast mode)...")
-    return get_match_details(match_url)
+def wait_for_toss(match_url: str, max_retries: int = 6, interval: int = 60) -> dict | None:
+    log.info(f"Polling toss every {interval}s (max {max_retries} tries)...")
+
+    for i in range(max_retries):
+        details = get_match_details(match_url)
+        if details:
+            return details
+
+        log.info(f"[{i+1}/{max_retries}] Toss not yet... retrying...")
+        time.sleep(interval)
+
+    log.warning("Toss not found after retries.")
+    return None
 
 
 # ─── STEP 4: RUN PREDICTION ──────────────────────────────────────────────────
