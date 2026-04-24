@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: ipl-predictor-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+
+    envVars:
+      - key: ARTIFACTS_URL
+        value: https://github.com/mohdfahad20/IPL-2026-Live-Prediction/releases/download/latest-data/artifacts.zip
+      - key: PYTHON_VERSION
+        value: "3.11"

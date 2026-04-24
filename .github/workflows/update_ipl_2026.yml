@@ -1,27 +1,17 @@
 name: IPL 2026 Pipeline
 
-# on:
-#   schedule:
-#     - cron: "0 18 * * *"       # nightly
-#     - cron: "30 13 * * 1-5"    # weekday toss
-#     - cron: "45 9 * * 0,6"     # weekend afternoon
-#     - cron: "30 13 * * 0,6"    # weekend evening
-
 on:
   schedule:
     - cron: "0 18 * * *"         # nightly pipeline
-
-    # Weekdays (evening match only)
-    - cron: "*/5 13-15 * * 1-5"
-
-    # Weekends (afternoon + evening)
-    - cron: "*/5 9-15 * * 0,6"
+    - cron: "*/5 13-15 * * 1-5"  # weekdays toss window
+    - cron: "*/5 9-15 * * 0,6"   # weekends toss window
 
   workflow_dispatch:
 
 jobs:
 
   update_results:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 18 * * *'
     runs-on: ubuntu-latest
 
     permissions:
@@ -38,17 +28,32 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ✅ Ensure DB exists (important for CI)
+      # ── Download existing artifacts ─────────────────────────
+      - name: Download existing artifacts
+        run: |
+          curl -f -L -o artifacts.zip \
+            https://github.com/mohdfahad20/IPL-2026-Live-Prediction/releases/download/latest-data/artifacts.zip \
+            || echo "No existing release found"
+
+          if [ -f artifacts.zip ]; then
+            unzip -o artifacts.zip
+            rm artifacts.zip
+            echo "Artifacts extracted"
+          else
+            echo "No artifacts to extract"
+          fi
+
+      # ── Initialize DB if missing ────────────────────────────
       - name: Initialize DB if missing
         run: |
           if [ ! -f "ipl.db" ]; then
-            echo "DB not found → creating from base dataset"
+            echo "Creating DB from base dataset"
             python data/load_kaggle_data.py
           else
-            echo "DB already exists"
+            echo "DB exists"
           fi
 
-      # 🔁 PIPELINE (CORRECT ORDER)
+      # ── PIPELINE ────────────────────────────────────────────
       - name: Scrape matches
         run: python scraper/scrapper_data.py --db ipl.db
 
@@ -67,23 +72,50 @@ jobs:
       - name: Log results
         run: python logger.py --db ipl.db
 
-      # ✅ Commit updated DB + logs
-      - name: Commit updates
+      # ── PACKAGE ARTIFACTS ───────────────────────────────────
+      - name: Package artifacts
+        run: |
+          zip -r artifacts.zip ipl.db models/
+          echo "Artifact size:"
+          du -sh artifacts.zip
+
+      # ── UPLOAD TO RELEASE ───────────────────────────────────
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-data
+          name: "Latest IPL Data"
+          files: artifacts.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── TRIGGER RENDER ──────────────────────────────────────
+      - name: Trigger Render redeploy
+        run: |
+          if [ -n "${{ secrets.RENDER_DEPLOY_HOOK }}" ]; then
+            curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+            echo "Render redeploy triggered"
+          else
+            echo "No deploy hook set"
+          fi
+
+      # ── COMMIT LIGHT FILES ONLY ─────────────────────────────
+      - name: Commit logs
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add ipl.db *.csv || true
+          git add toss_predictions.csv winner_log.csv match_predictions_log.csv || true
 
           if git diff --cached --quiet; then
             echo "No changes"
           else
-            git commit -m "auto update: data + model [$(date -u)]"
+            git commit -m "auto update: logs [$(date -u)]"
             git push
           fi
 
 
   toss_prediction:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule != '0 18 * * *'
     runs-on: ubuntu-latest
 
     permissions:
@@ -100,7 +132,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ✅ Ensure DB exists
+      # ── Download artifacts ──────────────────────────────────
+      - name: Download existing artifacts
+        run: |
+          curl -L -o artifacts.zip \
+            https://github.com/mohdfahad20/IPL-2026-Live-Prediction/releases/download/latest-data/artifacts.zip \
+            || echo "No artifacts found"
+
+          if [ -f artifacts.zip ]; then
+            unzip -o artifacts.zip
+            rm artifacts.zip
+          fi
+
+      # ── Initialize DB if needed ─────────────────────────────
       - name: Initialize DB if missing
         run: |
           if [ ! -f "ipl.db" ]; then
@@ -110,15 +154,16 @@ jobs:
       - name: Run toss predictor
         run: python toss_scraper.py --db ipl.db
 
+      # ── Commit toss logs ────────────────────────────────────
       - name: Commit toss updates
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add toss_predictions.csv ipl.db || true
+          git add toss_predictions.csv || true
 
           if git diff --cached --quiet; then
-            echo "No toss updates"
+            echo "No updates"
           else
             git commit -m "auto update: toss [$(date -u)]"
             git push
