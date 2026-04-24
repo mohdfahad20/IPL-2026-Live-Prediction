@@ -75,16 +75,6 @@ jobs:
           if [ ! -f "ipl.db" ]; then
             python data/load_kaggle_data.py --csv data/IPL.csv --db ipl.db
           fi
-      - name: Clean simulation results
-        run: |
-          python - <<EOF
-          import sqlite3
-          conn = sqlite3.connect("ipl.db")
-          conn.execute("DELETE FROM simulation_results")
-          conn.commit()
-          conn.close()
-          print("Cleaned simulation_results")
-          EOF
 
       # ── PIPELINE ────────────────────────────────────────────
       - name: Scrape matches
@@ -108,7 +98,7 @@ jobs:
       # ── Package artifacts ───────────────────────────────────
       - name: Package artifacts
         run: |
-          zip -r artifacts.zip ipl.db models/
+          zip -r artifacts.zip ipl.db models/ standings.json
           du -sh artifacts.zip
 
       # ── Upload release ──────────────────────────────────────
