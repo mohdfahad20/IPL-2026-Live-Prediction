@@ -7,18 +7,16 @@ log = logging.getLogger(__name__)
 
 
 def get_db() -> sqlite3.Connection:
-    """Return a new SQLite connection. Caller must close it."""
-    return sqlite3.connect(DB_PATH)
+    """Return a new SQLite connection."""
+    conn = sqlite3.connect(DB_PATH)
+    return conn
 
 
 @contextmanager
 def db_connection():
     """
-    Context manager — auto-closes connection.
-
-    Usage:
-        with db_connection() as conn:
-            conn.execute(...)
+    Context manager for DB connection.
+    Auto-closes connection safely.
     """
     conn = sqlite3.connect(DB_PATH)
     try:

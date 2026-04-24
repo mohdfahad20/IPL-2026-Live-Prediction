@@ -6,13 +6,16 @@ log = logging.getLogger(__name__)
 
 
 def get_latest_probabilities() -> dict:
-    """Latest simulation run from simulation_results table."""
+    """
+    Return ONLY the latest simulation run.
+    Uses run_id (not run_at) to avoid ordering bugs.
+    """
     with db_connection() as conn:
         row = conn.execute("""
             SELECT run_id, run_at, n_simulations,
                    matches_played, matches_remaining, results_json
             FROM simulation_results
-            ORDER BY run_at DESC
+            ORDER BY run_id DESC
             LIMIT 1
         """).fetchone()
 
@@ -31,8 +34,9 @@ def get_latest_probabilities() -> dict:
 
 def get_probability_history() -> list:
     """
-    All simulation runs for trend chart.
-    One entry per unique matches_played value (latest run only).
+    Return history of simulation runs.
+    Keeps ONLY latest run per matches_played value.
+    Uses run_id ordering (safe).
     """
     with db_connection() as conn:
         rows = conn.execute("""
@@ -40,10 +44,10 @@ def get_probability_history() -> list:
                    matches_played, matches_remaining, results_json
             FROM simulation_results
             WHERE matches_played <= 70
-            ORDER BY run_at ASC
+            ORDER BY run_id ASC
         """).fetchall()
 
-    # Deduplicate — keep latest run per matches_played count
+    # Deduplicate → latest per matches_played
     seen: dict = {}
     for row in rows:
         key = row[3]  # matches_played
