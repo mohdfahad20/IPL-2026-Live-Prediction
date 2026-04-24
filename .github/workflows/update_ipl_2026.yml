@@ -2,9 +2,9 @@ name: IPL 2026 Pipeline
 
 on:
   schedule:
-    - cron: "0 18 * * *"         # nightly pipeline
-    - cron: "*/5 13-15 * * 1-5"  # weekdays toss window
-    - cron: "*/5 9-15 * * 0,6"   # weekends toss window
+    - cron: "0 18 * * *"
+    - cron: "*/5 13-15 * * 1-5"
+    - cron: "*/5 9-15 * * 0,6"
 
   workflow_dispatch:
 
@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── Download existing artifacts ─────────────────────────
+      # ── Download previous artifacts ─────────────────────────
       - name: Download existing artifacts
         run: |
           curl -f -L -o artifacts.zip \
@@ -38,19 +38,30 @@ jobs:
           if [ -f artifacts.zip ]; then
             unzip -o artifacts.zip
             rm artifacts.zip
-            echo "Artifacts extracted"
-          else
-            echo "No artifacts to extract"
           fi
 
-      # ── Initialize DB if missing ────────────────────────────
+      # ── Dataset Download ────────────────────────────────────
+      - name: Install gdown
+        run: pip install gdown
+
+      - name: Download dataset
+        run: |
+          mkdir -p data
+          gdown --fuzzy https://drive.google.com/uc?id=1i0fgnUjKEwQuGyMEfZq0JC26A8ZcEKAZ -O data/IPL.csv
+
+      - name: Verify dataset
+        run: |
+          if [ ! -s "data/IPL.csv" ]; then
+            echo "Dataset download failed"
+            exit 1
+          fi
+          ls -lh data/IPL.csv
+
+      # ── Initialize DB ───────────────────────────────────────
       - name: Initialize DB if missing
         run: |
           if [ ! -f "ipl.db" ]; then
-            echo "Creating DB from base dataset"
-            python data/load_kaggle_data.py
-          else
-            echo "DB exists"
+            python data/load_kaggle_data.py --csv data/IPL.csv --db ipl.db
           fi
 
       # ── PIPELINE ────────────────────────────────────────────
@@ -72,14 +83,13 @@ jobs:
       - name: Log results
         run: python logger.py --db ipl.db
 
-      # ── PACKAGE ARTIFACTS ───────────────────────────────────
+      # ── Package artifacts ───────────────────────────────────
       - name: Package artifacts
         run: |
           zip -r artifacts.zip ipl.db models/
-          echo "Artifact size:"
           du -sh artifacts.zip
 
-      # ── UPLOAD TO RELEASE ───────────────────────────────────
+      # ── Upload release ──────────────────────────────────────
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -88,17 +98,14 @@ jobs:
           files: artifacts.zip
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── TRIGGER RENDER ──────────────────────────────────────
+      # ── Trigger Render ──────────────────────────────────────
       - name: Trigger Render redeploy
         run: |
           if [ -n "${{ secrets.RENDER_DEPLOY_HOOK }}" ]; then
             curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
-            echo "Render redeploy triggered"
-          else
-            echo "No deploy hook set"
           fi
 
-      # ── COMMIT LIGHT FILES ONLY ─────────────────────────────
+      # ── Commit logs ─────────────────────────────────────────
       - name: Commit logs
         run: |
           git config user.name "github-actions[bot]"
@@ -106,9 +113,7 @@ jobs:
 
           git add toss_predictions.csv winner_log.csv match_predictions_log.csv || true
 
-          if git diff --cached --quiet; then
-            echo "No changes"
-          else
+          if ! git diff --cached --quiet; then
             git commit -m "auto update: logs [$(date -u)]"
             git push
           fi
@@ -135,7 +140,7 @@ jobs:
       # ── Download artifacts ──────────────────────────────────
       - name: Download existing artifacts
         run: |
-          curl -L -o artifacts.zip \
+          curl -f -L -o artifacts.zip \
             https://github.com/mohdfahad20/IPL-2026-Live-Prediction/releases/download/latest-data/artifacts.zip \
             || echo "No artifacts found"
 
@@ -144,11 +149,27 @@ jobs:
             rm artifacts.zip
           fi
 
-      # ── Initialize DB if needed ─────────────────────────────
+      # ── Dataset Download ────────────────────────────────────
+      - name: Install gdown
+        run: pip install gdown
+
+      - name: Download dataset
+        run: |
+          mkdir -p data
+          gdown --fuzzy https://drive.google.com/uc?id=1i0fgnUjKEwQuGyMEfZq0JC26A8ZcEKAZ -O data/IPL.csv
+
+      - name: Verify dataset
+        run: |
+          if [ ! -s "data/IPL.csv" ]; then
+            echo "Dataset download failed"
+            exit 1
+          fi
+
+      # ── Initialize DB ───────────────────────────────────────
       - name: Initialize DB if missing
         run: |
           if [ ! -f "ipl.db" ]; then
-            python data/load_kaggle_data.py
+            python data/load_kaggle_data.py --csv data/IPL.csv --db ipl.db
           fi
 
       - name: Run toss predictor
@@ -162,9 +183,7 @@ jobs:
 
           git add toss_predictions.csv || true
 
-          if git diff --cached --quiet; then
-            echo "No updates"
-          else
+          if ! git diff --cached --quiet; then
             git commit -m "auto update: toss [$(date -u)]"
             git push
           fi
