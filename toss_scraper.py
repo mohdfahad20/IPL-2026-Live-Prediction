@@ -209,21 +209,25 @@ def get_match_details(match_url: str) -> dict | None:
 
 # ─── STEP 3: POLL UNTIL TOSS IS AVAILABLE ────────────────────────────────────
 
-def wait_for_toss(match_url: str, max_retries: int = 30, interval: int = 60) -> dict | None:
-    """
-    Polls the match page every `interval` seconds until toss is found.
-    Max wait = max_retries * interval seconds (default 30 min).
-    """
-    log.info(f"Polling for toss (max {max_retries} retries, every {interval}s)...")
-    for attempt in range(1, max_retries + 1):
-        details = get_match_details(match_url)
-        if details:
-            return details
-        log.info(f"  [{attempt}/{max_retries}] Toss not yet... retrying in {interval}s")
-        time.sleep(interval)
+# def wait_for_toss(match_url: str, max_retries: int = 3, interval: int = 300) -> dict | None:
+#     """
+#     Retry a few times with longer intervals.
+#     Total wait ~15 minutes max.
+#     """
+#     log.info(f"Polling for toss (max {max_retries} retries, every {interval}s)...")
+#     for attempt in range(1, max_retries + 1):
+#         details = get_match_details(match_url)
+#         if details:
+#             return details
+#         log.info(f"  [{attempt}/{max_retries}] Toss not yet... retrying in {interval}s")
+#         time.sleep(interval)
 
-    log.error("Toss not found after max retries.")
-    return None
+#     log.error("Toss not found after max retries.")
+#     return None
+
+def wait_for_toss(match_url: str) -> dict | None:
+    log.info("Checking toss once (fast mode)...")
+    return get_match_details(match_url)
 
 
 # ─── STEP 4: RUN PREDICTION ──────────────────────────────────────────────────
