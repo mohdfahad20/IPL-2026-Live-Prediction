@@ -9,8 +9,6 @@ from cricdata import CricinfoClient
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── CONFIG ─────────────────────────────────────────────
-
 DEFAULT_DB_PATH = Path("ipl.db")
 SERIES_SLUG = "ipl-2026-1510719"
 SEASON = "2026"
@@ -56,19 +54,23 @@ def fetch_fixtures():
     log.error("Failed to fetch data")
     return []
 
-# ─── Parse result ─────────────────────────────────────────────
+
+# ─── RESULT PARSE ───────────────────────────────────────
 
 def parse_result(m):
     status = (m.get("status") or m.get("statusText") or "").lower()
-    if "run" in status:
-        return "runs"
-    if "wicket" in status:
-        return "wickets"
-    if "tie" in status or "super over" in status:
-        return "super over"
+
     if "no result" in status or "abandon" in status:
         return "no result"
-    return "runs"  # fallback
+    if "tie" in status or "super over" in status:
+        return "super over"
+    if "wicket" in status:
+        return "wickets"
+    if "run" in status:
+        return "runs"
+
+    return "unknown"
+
 
 # ─── PARSE ─────────────────────────────────────────────
 
@@ -81,7 +83,7 @@ def build_match_record(m):
         team1 = normalise_team(teams[0]["team"]["longName"])
         team2 = normalise_team(teams[1]["team"]["longName"])
 
-        # Winner (SAFE method)
+        # winner (ALLOW None)
         winner = None
         winner_id = m.get("winnerTeamId")
 
@@ -89,38 +91,33 @@ def build_match_record(m):
             if t["team"]["id"] == winner_id:
                 winner = normalise_team(t["team"]["longName"])
 
-        if not winner:
-            return None
-
-        # Date
+        # date
         date_raw = m.get("startDate")
         date_str = date_raw[:10] if date_raw else None
-
         if not date_str:
             return None
 
-        # Toss
+        # toss
         toss = m.get("toss") or {}
         toss_winner = normalise_team(toss.get("winner", {}).get("longName"))
         toss_decision = toss.get("decision")
 
-        # Venue
+        # venue
         ground = m.get("ground", {})
         venue = ground.get("longName") or ground.get("name")
         city = ground.get("town", {}).get("name")
 
-        # Player of match
+        # pom
         pom_list = m.get("playerOfMatch", [])
         pom = pom_list[0]["longName"] if pom_list else None
 
-        # Match ID (SAFE)
         match_id_raw = m.get("objectId") or m.get("id")
         if not match_id_raw:
             return None
 
         match_id = f"{SEASON}_{match_id_raw}"
 
-        record = {
+        return {
             "match_id": match_id,
             "season": SEASON,
             "date": date_str,
@@ -130,7 +127,7 @@ def build_match_record(m):
             "team2": team2,
             "toss_winner": toss_winner,
             "toss_decision": toss_decision,
-            "winner": winner,
+            "winner": winner,  # ✅ IMPORTANT
             "result": parse_result(m),
             "result_margin": None,
             "player_of_match": pom,
@@ -140,14 +137,10 @@ def build_match_record(m):
             "source": "cricdata_2026",
         }
 
-        return record
-
     except Exception as e:
         log.warning(f"Parse error: {e}")
         return None
 
-
-# ─── INSERT ─────────────────────────────────────────────
 
 COLS = [
     "match_id", "season", "date", "city", "venue",
@@ -157,36 +150,39 @@ COLS = [
 ]
 
 
-def insert_matches(matches, conn, dry_run=False):
-    existing = set(r[0] for r in conn.execute("SELECT match_id FROM matches"))
+# ─── UPSERT ─────────────────────────────────────────────
 
+def insert_matches(matches, conn, dry_run=False):
     inserted = 0
 
     for m in matches:
         if not m:
             continue
 
-        if m["match_id"] in existing:
-            continue
-
-        if dry_run:
-            log.info(f"[DRY RUN] {m['team1']} vs {m['team2']} → {m['winner']}\n")
-            continue
-
         values = [m.get(c) for c in COLS]
 
+        if dry_run:
+            log.info(f"[DRY RUN] {m['team1']} vs {m['team2']}")
+            continue
+
         conn.execute(
-            f"INSERT INTO matches ({', '.join(COLS)}) VALUES ({', '.join(['?']*len(COLS))})",
+            f"""
+            INSERT INTO matches ({', '.join(COLS)})
+            VALUES ({', '.join(['?']*len(COLS))})
+            ON CONFLICT(match_id) DO UPDATE SET
+                winner=excluded.winner,
+                result=excluded.result,
+                toss_winner=excluded.toss_winner,
+                toss_decision=excluded.toss_decision,
+                player_of_match=excluded.player_of_match
+            """,
             values
         )
 
         inserted += 1
-        log.info(f"Inserted: {m['team1']} vs {m['team2']}")
 
-    if not dry_run:
-        conn.commit()
-
-    log.info(f"Inserted total: {inserted}")
+    conn.commit()
+    log.info(f"Upserted total: {inserted}")
 
 
 # ─── MAIN ─────────────────────────────────────────────
@@ -202,22 +198,23 @@ def main():
 
     matches_raw = fetch_fixtures()
 
-    records = []
-    for m in matches_raw:
-        rec = build_match_record(m)
-        if rec:
-            records.append(rec)
+    records = [build_match_record(m) for m in matches_raw]
+    records = [r for r in records if r]
 
-    log.info(f"Parsed completed matches: {len(records)}")
-
-    if not records:
-        log.warning("No matches to insert")
-        return
+    log.info(f"Parsed matches (including NR): {len(records)}")
 
     conn = sqlite3.connect(db_path)
 
     try:
         insert_matches(records, conn, dry_run=args.dry_run)
+
+        # DEBUG CHECK
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM matches WHERE season='2026'"
+        ).fetchone()[0]
+
+        log.info(f"Total matches in DB after scrape: {cnt}")
+
     finally:
         conn.close()
 
