@@ -26,11 +26,9 @@ test.db
 IPL.csv
 
 # Data files
-*.db
 *.csv
 
 archive
 
-ipl.db
 *.pkl
 models/
