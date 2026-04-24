@@ -2,35 +2,23 @@ name: IPL 2026 Pipeline
 
 on:
   schedule:
-    - cron: "0 18 * * *"
-    - cron: "30 13 * * 1-5"
-    - cron: "45 9 * * 0,6"
-    - cron: "30 13 * * 0,6"
+    - cron: "0 18 * * *"       # nightly
+    - cron: "30 13 * * 1-5"    # weekday toss
+    - cron: "45 9 * * 0,6"     # weekend afternoon
+    - cron: "30 13 * * 0,6"    # weekend evening
 
   workflow_dispatch:
-    inputs:
-      job:
-        description: "Which job to run"
-        required: false
-        default: "all"
-        type: choice
-        options: [all, results, toss]
 
 jobs:
 
   update_results:
     runs-on: ubuntu-latest
-    if: >
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'all' || github.event.inputs.job == 'results')) ||
-      (github.event_name == 'schedule' && github.event.schedule == '0 18 * * *')
 
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - uses: actions/setup-python@v5
         with:
@@ -40,65 +28,59 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ───── YOUR EXISTING PIPELINE ─────
-      - name: Scrape 2026 match results
+      # ✅ Ensure DB exists (important for CI)
+      - name: Initialize DB if missing
+        run: |
+          if [ ! -f "ipl.db" ]; then
+            echo "DB not found → creating from base dataset"
+            python data/load_kaggle_data.py
+          else
+            echo "DB already exists"
+          fi
+
+      # 🔁 PIPELINE (CORRECT ORDER)
+      - name: Scrape matches
         run: python scraper/scrapper_data.py --db ipl.db
 
-      - name: Scrape IPL standings
+      - name: Scrape standings
         run: python scrape_standings.py
 
-      - name: Rebuild features
+      - name: Feature engineering
         run: python features/features.py --db ipl.db
 
-      - name: Retrain model
+      - name: Train model
         run: python model/train.py --db ipl.db
 
       - name: Run simulation
         run: python -m simulate.simulate --db ipl.db --n 10000
 
-      - name: Log predictions
+      - name: Log results
         run: python logger.py --db ipl.db
 
-      # ───── NEW STEP (CRITICAL) ─────
-      - name: Export lightweight data
-        run: python export_data.py
-
-      # ───── PUSH TO GITHUB ─────
-      - name: Commit backend updates
+      # ✅ Commit updated DB + logs
+      - name: Commit updates
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add standings.json probabilities.json toss_predictions.csv || true
+          git add ipl.db *.csv || true
 
           if git diff --cached --quiet; then
-            echo "No changes."
+            echo "No changes"
           else
-            git commit -m "data update [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "auto update: data + model [$(date -u)]"
             git push
           fi
-
-      # ───── PUSH TO HUGGING FACE ─────
-      - name: Push to Hugging Face
-        run: |
-          git remote add hf https://user:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/VeNoM21/ipl-2026-live-predictor
-
-          git push hf main --force
 
 
   toss_prediction:
     runs-on: ubuntu-latest
-    if: >
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'all' || github.event.inputs.job == 'toss')) ||
-      (github.event_name == 'schedule' && github.event.schedule != '0 18 * * *')
 
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - uses: actions/setup-python@v5
         with:
@@ -108,29 +90,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # ✅ Ensure DB exists
+      - name: Initialize DB if missing
+        run: |
+          if [ ! -f "ipl.db" ]; then
+            python data/load_kaggle_data.py
+          fi
+
       - name: Run toss predictor
         run: python toss_scraper.py --db ipl.db
 
-      # ───── EXPORT AGAIN ─────
-      - name: Export lightweight data
-        run: python export_data.py
-
-      - name: Commit toss log
+      - name: Commit toss updates
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add toss_predictions.csv standings.json probabilities.json || true
+          git add toss_predictions.csv ipl.db || true
 
           if git diff --cached --quiet; then
-            echo "No toss data today."
+            echo "No toss updates"
           else
-            git commit -m "toss update [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "auto update: toss [$(date -u)]"
             git push
           fi
-
-      - name: Push to Hugging Face
-        run: |
-          git remote add hf https://user:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/VeNoM21/ipl-2026-live-predictor
-
-          git push hf main --force

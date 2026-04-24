@@ -1,5 +1,5 @@
 {
-  "scraped_at": "2026-04-23T11:07:22.396590",
+  "scraped_at": "2026-04-24T05:38:16.903658",
   "standings": [
     {
       "team": "Punjab Kings",
@@ -42,6 +42,16 @@
       "Form": ""
     },
     {
+      "team": "Chennai Super Kings",
+      "M": 7,
+      "W": 3,
+      "L": 4,
+      "NR": 0,
+      "Pts": 6,
+      "NRR": 0.118,
+      "Form": ""
+    },
+    {
       "team": "Delhi Capitals",
       "M": 6,
       "W": 3,
@@ -63,22 +73,12 @@
     },
     {
       "team": "Mumbai Indians",
-      "M": 6,
+      "M": 7,
       "W": 2,
-      "L": 4,
+      "L": 5,
       "NR": 0,
       "Pts": 4,
-      "NRR": 0.067,
-      "Form": ""
-    },
-    {
-      "team": "Chennai Super Kings",
-      "M": 6,
-      "W": 2,
-      "L": 4,
-      "NR": 0,
-      "Pts": 4,
-      "NRR": -0.78,
+      "NRR": -0.736,
       "Form": ""
     },
     {
