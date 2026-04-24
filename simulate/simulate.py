@@ -74,13 +74,25 @@ CREATE TABLE IF NOT EXISTS simulation_results (
 # ─── LOAD COMPLETED 2026 MATCHES ─────────────────────────────────────────────
 
 def load_completed(conn: sqlite3.Connection) -> pd.DataFrame:
+    """
+    Load ALL played matches for IPL 2026:
+    - includes wins/losses
+    - includes no result / abandoned matches
+    """
+
     df = pd.read_sql("""
-        SELECT match_id, date, team1, team2, winner, venue, stage
+        SELECT match_id, date, team1, team2, winner, venue, stage, result, method
         FROM matches
-        WHERE season = '2026' AND winner IS NOT NULL
+        WHERE season = '2026'
+        AND (
+            winner IS NOT NULL
+            OR result IS NOT NULL
+            OR method IN ('no result', 'abandoned')
+        )
         ORDER BY date ASC, match_id ASC
     """, conn)
-    log.info(f"Completed 2026 matches in DB: {len(df)}")
+
+    log.info(f"Completed (including NR) 2026 matches in DB: {len(df)}")
     return df
 
 
@@ -88,73 +100,124 @@ def load_completed(conn: sqlite3.Connection) -> pd.DataFrame:
 
 def build_remaining(completed: pd.DataFrame) -> pd.DataFrame:
     """
-    Generate remaining group stage fixtures respecting the IPL constraint
-    that each team plays exactly MATCHES_PER_TEAM (14) group matches.
-
-    For each team, count how many they have already played, then generate
-    only as many more fixtures as they need to reach 14. Pairs that have
-    already played twice are excluded. This avoids over-simulating matches
-    and keeps per-team totals correct.
+    Generate remaining fixtures ensuring:
+    - Each team ends with exactly 14 matches
+    - Each pair plays at most twice
+    - Total schedule remains consistent
     """
+
     from collections import Counter, defaultdict
+    from itertools import combinations
+    import random
+    import pandas as pd
 
-    MATCHES_PER_TEAM = 14   # each team plays exactly 14 group stage matches
+    MATCHES_PER_TEAM = 14
 
-    # Count matches already played per team
+    # ─── STEP 1: Count played matches ───
     team_played = defaultdict(int)
     pair_counts = Counter()
+
     for _, r in completed.iterrows():
         t1, t2 = r["team1"], r["team2"]
+
+        # COUNT ALL matches (including NR)
         team_played[t1] += 1
         team_played[t2] += 1
         pair_counts[tuple(sorted([t1, t2]))] += 1
 
-    # How many more matches does each team need?
-    team_remaining = {t: max(0, MATCHES_PER_TEAM - team_played[t]) for t in IPL_2026_TEAMS}
+    # ─── STEP 2: Remaining matches per team ───
+    team_remaining = {
+        t: max(0, MATCHES_PER_TEAM - team_played[t])
+        for t in IPL_2026_TEAMS
+    }
 
-    # Generate fixtures: try all pairs, add if both teams still need matches
-    # and this pair hasn't played twice yet
+    # ─── STEP 3: Generate fixtures (greedy) ───
     all_pairs = list(combinations(IPL_2026_TEAMS, 2))
-    # Shuffle pairs so no team is systematically disadvantaged
-    import random
     random.seed(42)
     random.shuffle(all_pairs)
 
     fixtures = []
     idx = 0
+
     for t1, t2 in all_pairs:
         pair = tuple(sorted([t1, t2]))
         already_played = pair_counts.get(pair, 0)
-        max_pair_plays = 2   # each pair can meet at most twice
+        max_pair_plays = 2
 
         games_to_add = min(
-            max_pair_plays - already_played,   # pair still has slots
-            team_remaining[t1],                 # t1 still needs matches
-            team_remaining[t2],                 # t2 still needs matches
+            max_pair_plays - already_played,
+            team_remaining[t1],
+            team_remaining[t2],
         )
 
         for _ in range(max(0, games_to_add)):
             fixtures.append({
                 "match_id": f"2026_gen_{idx:04d}",
-                "date":     "2026-05-01",
-                "team1":    t1,
-                "team2":    t2,
-                "winner":   None,
-                "venue":    None,
-                "stage":    "Unknown",
+                "date": "2026-05-01",
+                "team1": t1,
+                "team2": t2,
+                "winner": None,
+                "venue": None,
+                "stage": "Unknown",
             })
             team_remaining[t1] -= 1
             team_remaining[t2] -= 1
             idx += 1
 
     remaining = pd.DataFrame(fixtures)
-    log.info(f"Remaining group fixtures to simulate: {len(remaining)}")
 
-    # Sanity check — log per-team remaining match counts
+    # ─── STEP 4: REPAIR (CRITICAL FIX) ───
     team_sim = defaultdict(int)
     for _, r in remaining.iterrows():
         team_sim[r["team1"]] += 1
         team_sim[r["team2"]] += 1
+
+    deficit = {}
+    for t in IPL_2026_TEAMS:
+        total = team_played[t] + team_sim[t]
+        if total < MATCHES_PER_TEAM:
+            deficit[t] = MATCHES_PER_TEAM - total
+
+    if deficit:
+        log.warning(f"Repairing incomplete schedule: {deficit}")
+
+        teams = list(deficit.keys())
+
+        for i in range(len(teams)):
+            for j in range(i + 1, len(teams)):
+                t1, t2 = teams[i], teams[j]
+
+                pair = tuple(sorted([t1, t2]))
+                if pair_counts[pair] >= 2:
+                    continue
+
+                while deficit[t1] > 0 and deficit[t2] > 0:
+                    remaining = pd.concat([
+                        remaining,
+                        pd.DataFrame([{
+                            "match_id": f"2026_fix_{idx:04d}",
+                            "date": "2026-05-01",
+                            "team1": t1,
+                            "team2": t2,
+                            "winner": None,
+                            "venue": None,
+                            "stage": "Unknown",
+                        }])
+                    ], ignore_index=True)
+
+                    deficit[t1] -= 1
+                    deficit[t2] -= 1
+                    pair_counts[pair] += 1
+                    idx += 1
+
+    # ─── STEP 5: FINAL LOGGING ───
+    log.info(f"Remaining group fixtures to simulate: {len(remaining)}")
+
+    team_sim = defaultdict(int)
+    for _, r in remaining.iterrows():
+        team_sim[r["team1"]] += 1
+        team_sim[r["team2"]] += 1
+
     for t in sorted(IPL_2026_TEAMS):
         total = team_played[t] + team_sim[t]
         log.info(f"  {t:<35} played={team_played[t]:2d}  simulated={team_sim[t]:2d}  total={total}")
