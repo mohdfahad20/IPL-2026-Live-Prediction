@@ -28,6 +28,15 @@ TEAM_ALIASES = {
 }
 
 
+# ✅ FIX 1 — DEFINE COLS GLOBALLY
+COLS = [
+    "match_id", "season", "date", "city", "venue",
+    "team1", "team2", "toss_winner", "toss_decision",
+    "winner", "result", "result_margin", "player_of_match",
+    "method", "stage", "event_match_no", "source",
+]
+
+
 def normalise_team(name):
     if not name:
         return None
@@ -76,6 +85,16 @@ def parse_result(m):
 
 def build_match_record(m):
     try:
+        status = (m.get("status") or m.get("statusText") or "").lower()
+
+        # ✅ FIX 2 — PROPER FILTER
+        is_completed = any(x in status for x in [
+            "result", "won", "tie", "no result", "abandon"
+        ])
+
+        if not is_completed:
+            return None
+
         teams = m.get("teams", [])
         if len(teams) < 2:
             return None
@@ -83,7 +102,7 @@ def build_match_record(m):
         team1 = normalise_team(teams[0]["team"]["longName"])
         team2 = normalise_team(teams[1]["team"]["longName"])
 
-        # winner (ALLOW None)
+        # Winner (None allowed for NR)
         winner = None
         winner_id = m.get("winnerTeamId")
 
@@ -91,26 +110,31 @@ def build_match_record(m):
             if t["team"]["id"] == winner_id:
                 winner = normalise_team(t["team"]["longName"])
 
-        # date
+        # Extra safety: skip if no winner AND not NR
+        if not winner and "no result" not in status:
+            return None
+
+        # Date
         date_raw = m.get("startDate")
         date_str = date_raw[:10] if date_raw else None
         if not date_str:
             return None
 
-        # toss
+        # Toss
         toss = m.get("toss") or {}
         toss_winner = normalise_team(toss.get("winner", {}).get("longName"))
         toss_decision = toss.get("decision")
 
-        # venue
+        # Venue
         ground = m.get("ground", {})
         venue = ground.get("longName") or ground.get("name")
         city = ground.get("town", {}).get("name")
 
-        # pom
+        # Player of match
         pom_list = m.get("playerOfMatch", [])
         pom = pom_list[0]["longName"] if pom_list else None
 
+        # Match ID
         match_id_raw = m.get("objectId") or m.get("id")
         if not match_id_raw:
             return None
@@ -127,7 +151,7 @@ def build_match_record(m):
             "team2": team2,
             "toss_winner": toss_winner,
             "toss_decision": toss_decision,
-            "winner": winner,  # ✅ IMPORTANT
+            "winner": winner,
             "result": parse_result(m),
             "result_margin": None,
             "player_of_match": pom,
@@ -140,14 +164,6 @@ def build_match_record(m):
     except Exception as e:
         log.warning(f"Parse error: {e}")
         return None
-
-
-COLS = [
-    "match_id", "season", "date", "city", "venue",
-    "team1", "team2", "toss_winner", "toss_decision",
-    "winner", "result", "result_margin", "player_of_match",
-    "method", "stage", "event_match_no", "source",
-]
 
 
 # ─── UPSERT ─────────────────────────────────────────────
@@ -208,7 +224,6 @@ def main():
     try:
         insert_matches(records, conn, dry_run=args.dry_run)
 
-        # DEBUG CHECK
         cnt = conn.execute(
             "SELECT COUNT(*) FROM matches WHERE season='2026'"
         ).fetchone()[0]
