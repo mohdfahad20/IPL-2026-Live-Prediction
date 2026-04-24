@@ -156,7 +156,7 @@ jobs:
       - name: Download dataset
         run: |
           mkdir -p data
-          gdown --fuzzy https://drive.google.com/uc?id=1i0fgnUjKEwQuGyMEfZq0JC26A8ZcEKAZ -O data/IPL.csv
+          gdown https://drive.google.com/uc?id=1i0fgnUjKEwQuGyMEfZq0JC26A8ZcEKAZ -O data/IPL.csv
 
       - name: Verify dataset
         run: |
