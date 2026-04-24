@@ -9,10 +9,13 @@ name: IPL 2026 Pipeline
 
 on:
   schedule:
-    - cron: "0 18 * * *"       # nightly pipeline
+    - cron: "0 18 * * *"         # nightly pipeline
 
-    # 🔥 NEW (toss detection)
-    - cron: "*/5 9-19 * * *"      # check toss every 5 minutes
+    # Weekdays (evening match only)
+    - cron: "*/5 13-15 * * 1-5"
+
+    # Weekends (afternoon + evening)
+    - cron: "*/5 9-15 * * 0,6"
 
   workflow_dispatch:
 
