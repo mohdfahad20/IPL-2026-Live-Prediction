@@ -8,27 +8,38 @@ from api.core.config import DB_PATH, MODELS_DIR, ARTIFACTS_URL
 log = logging.getLogger(__name__)
 
 
+# def ensure_artifacts():
+#     """
+#     Ensure ipl.db + models/ are available.
+
+#     - If present locally → skip
+#     - If missing → download from GitHub Release
+#     """
+
+#     db_ok = DB_PATH.exists()
+#     models_ok = MODELS_DIR.exists() and any(MODELS_DIR.iterdir())
+
+#     if db_ok and models_ok:
+#         log.info("Artifacts already present — skipping download.")
+#         return
+
+#     if not ARTIFACTS_URL:
+#         raise RuntimeError(
+#             "Artifacts missing and ARTIFACTS_URL not set. "
+#             "Run pipeline locally or configure backend properly."
+#         )
+
+#     _download_with_retry(ARTIFACTS_URL)
+
 def ensure_artifacts():
     """
-    Ensure ipl.db + models/ are available.
-
-    - If present locally → skip
-    - If missing → download from GitHub Release
+    Always refresh artifacts on startup.
     """
 
-    db_ok = DB_PATH.exists()
-    models_ok = MODELS_DIR.exists() and any(MODELS_DIR.iterdir())
-
-    if db_ok and models_ok:
-        log.info("Artifacts already present — skipping download.")
-        return
-
     if not ARTIFACTS_URL:
-        raise RuntimeError(
-            "Artifacts missing and ARTIFACTS_URL not set. "
-            "Run pipeline locally or configure backend properly."
-        )
+        raise RuntimeError("ARTIFACTS_URL not set")
 
+    log.info("Refreshing artifacts from GitHub Release...")
     _download_with_retry(ARTIFACTS_URL)
 
 
