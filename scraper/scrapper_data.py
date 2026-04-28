@@ -27,8 +27,6 @@ TEAM_ALIASES = {
     "Royal Challengers Bangalore": "Royal Challengers Bengaluru",
 }
 
-
-# ✅ FIX 1 — DEFINE COLS GLOBALLY
 COLS = [
     "match_id", "season", "date", "city", "venue",
     "team1", "team2", "toss_winner", "toss_decision",
@@ -47,9 +45,7 @@ def normalise_team(name):
 
 def fetch_fixtures():
     log.info(f"Fetching fixtures for: {SERIES_SLUG}")
-
     ci = CricinfoClient()
-
     for attempt in range(3):
         try:
             data = ci.series_fixtures(SERIES_SLUG)
@@ -59,7 +55,6 @@ def fetch_fixtures():
         except Exception as e:
             log.warning(f"Retry {attempt+1}: {e}")
             time.sleep(2)
-
     log.error("Failed to fetch data")
     return []
 
@@ -68,7 +63,6 @@ def fetch_fixtures():
 
 def parse_result(m):
     status = (m.get("status") or m.get("statusText") or "").lower()
-
     if "no result" in status or "abandon" in status:
         return "no result"
     if "tie" in status or "super over" in status:
@@ -77,7 +71,6 @@ def parse_result(m):
         return "wickets"
     if "run" in status:
         return "runs"
-
     return "unknown"
 
 
@@ -87,9 +80,8 @@ def build_match_record(m):
     try:
         status = (m.get("status") or m.get("statusText") or "").lower()
 
-        # ✅ FIX 2 — PROPER FILTER
         is_completed = any(x in status for x in [
-            "result", "won", "tie", "no result", "abandon"
+            "result", "won", "tie", "no result", "abandon", "super over"
         ])
 
         if not is_completed:
@@ -102,63 +94,89 @@ def build_match_record(m):
         team1 = normalise_team(teams[0]["team"]["longName"])
         team2 = normalise_team(teams[1]["team"]["longName"])
 
-        # Winner (None allowed for NR)
+        is_no_result = "no result" in status or "abandon" in status
+        is_super_over = "super over" in status
+
+        # ─── WINNER EXTRACTION ───
         winner = None
+
+        # 1. Primary winner
         winner_id = m.get("winnerTeamId")
+        if winner_id:
+            for t in teams:
+                if t["team"]["id"] == winner_id:
+                    winner = normalise_team(t["team"]["longName"])
 
-        for t in teams:
-            if t["team"]["id"] == winner_id:
-                winner = normalise_team(t["team"]["longName"])
+        # 2. Super over fallback
+        if not winner and is_super_over:
+            so_winner_id = (
+                m.get("superoverWinnerTeamId") or
+                m.get("superOverWinnerTeamId") or
+                m.get("superover_winner_team_id") or
+                (m.get("winner") or {}).get("id")
+            )
+            if so_winner_id:
+                for t in teams:
+                    if t["team"]["id"] == so_winner_id:
+                        winner = normalise_team(t["team"]["longName"])
 
-        # Extra safety: skip if no winner AND not NR
-        if not winner and "no result" not in status:
-            return None
+        # 3. Status text fallback
+        if not winner and not is_no_result:
+            status_text = (m.get("statusText") or "").lower()
+            for t in teams:
+                name = t["team"]["longName"]
+                if name and name.lower() in status_text:
+                    winner = normalise_team(name)
+                    break
+            if not winner:
+                for short, full in TEAM_ALIASES.items():
+                    if short.lower() in status_text or full.lower() in status_text:
+                        winner = full
+                        break
 
-        # Date
+        # ─── DATE ───
         date_raw = m.get("startDate")
         date_str = date_raw[:10] if date_raw else None
         if not date_str:
             return None
 
-        # Toss
-        toss = m.get("toss") or {}
-        toss_winner = normalise_team(toss.get("winner", {}).get("longName"))
+        # ─── TOSS ───
+        toss          = m.get("toss") or {}
+        toss_winner   = normalise_team(toss.get("winner", {}).get("longName"))
         toss_decision = toss.get("decision")
 
-        # Venue
+        # ─── VENUE ───
         ground = m.get("ground", {})
-        venue = ground.get("longName") or ground.get("name")
-        city = ground.get("town", {}).get("name")
+        venue  = ground.get("longName") or ground.get("name")
+        city   = ground.get("town", {}).get("name")
 
-        # Player of match
+        # ─── PLAYER OF MATCH ───
         pom_list = m.get("playerOfMatch", [])
-        pom = pom_list[0]["longName"] if pom_list else None
+        pom      = pom_list[0]["longName"] if pom_list else None
 
-        # Match ID
+        # ─── MATCH ID ───
         match_id_raw = m.get("objectId") or m.get("id")
         if not match_id_raw:
             return None
 
-        match_id = f"{SEASON}_{match_id_raw}"
-
         return {
-            "match_id": match_id,
-            "season": SEASON,
-            "date": date_str,
-            "city": city,
-            "venue": venue,
-            "team1": team1,
-            "team2": team2,
-            "toss_winner": toss_winner,
-            "toss_decision": toss_decision,
-            "winner": winner,
-            "result": parse_result(m),
-            "result_margin": None,
+            "match_id":        f"{SEASON}_{match_id_raw}",
+            "season":          SEASON,
+            "date":            date_str,
+            "city":            city,
+            "venue":           venue,
+            "team1":           team1,
+            "team2":           team2,
+            "toss_winner":     toss_winner,
+            "toss_decision":   toss_decision,
+            "winner":          winner,
+            "result":          parse_result(m),
+            "result_margin":   None,
             "player_of_match": pom,
-            "method": None,
-            "stage": m.get("stage", "Group"),
-            "event_match_no": m.get("number"),
-            "source": "cricdata_2026",
+            "method":          None,
+            "stage":           m.get("stage", "Group"),
+            "event_match_no":  m.get("number"),
+            "source":          "cricdata_2026",
         }
 
     except Exception as e:
@@ -186,15 +204,14 @@ def insert_matches(matches, conn, dry_run=False):
             INSERT INTO matches ({', '.join(COLS)})
             VALUES ({', '.join(['?']*len(COLS))})
             ON CONFLICT(match_id) DO UPDATE SET
-                winner=excluded.winner,
-                result=excluded.result,
-                toss_winner=excluded.toss_winner,
-                toss_decision=excluded.toss_decision,
-                player_of_match=excluded.player_of_match
+                winner          = excluded.winner,
+                result          = excluded.result,
+                toss_winner     = excluded.toss_winner,
+                toss_decision   = excluded.toss_decision,
+                player_of_match = excluded.player_of_match
             """,
             values
         )
-
         inserted += 1
 
     conn.commit()
@@ -220,7 +237,6 @@ def main():
     log.info(f"Parsed matches (including NR): {len(records)}")
 
     conn = sqlite3.connect(db_path)
-
     try:
         insert_matches(records, conn, dry_run=args.dry_run)
 
@@ -229,7 +245,6 @@ def main():
         ).fetchone()[0]
 
         log.info(f"Total matches in DB after scrape: {cnt}")
-
     finally:
         conn.close()
 
