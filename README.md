@@ -330,8 +330,9 @@ pip install -r requirements_frontend.txt
 # Build the database from Kaggle data
 python data/load_kaggle_data.py --csv data/IPL.csv --db ipl.db
 
-# Run the full pipeline
+# Run the full pipeline step by step
 python scraper/scrapper_data.py --db ipl.db
+python scrape_standings.py
 python features/features.py --db ipl.db
 python model/train.py --db ipl.db
 python -m simulate.simulate --db ipl.db --n 10000
@@ -344,6 +345,16 @@ uvicorn api.main:app --reload --port 8000
 # Start the local dashboard
 streamlit run dashboard/app_local.py
 ```
+
+### ⚡ One-Command Pipeline Execution
+
+> 💡 **Tip:** Instead of running each pipeline step manually, you can execute the entire pipeline with a single command:
+
+```bash
+python run_pipeline.py
+```
+
+This script runs all pipeline stages in sequence — scraping match results and standings, computing features, training the ensemble model, running the Monte Carlo simulation, and logging results to the database. Each step is timed, and the script exits immediately with a clear error message if any stage fails.
 
 ---
 
