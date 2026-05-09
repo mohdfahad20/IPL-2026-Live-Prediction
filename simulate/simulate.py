@@ -4,10 +4,12 @@ Phase 4 — Monte Carlo Simulation Engine
 Simulates the remaining IPL 2026 season 10,000 times and computes
 tournament win probabilities per team.
 
-Key fix from v1: always generate the full remaining schedule from the
-round-robin template, subtracting already-completed matches.
-This ensures all 10 teams appear in every simulation even early in
-the season.
+v3 changes (playoff-aware):
+  - League and playoff matches are handled separately throughout
+  - build_remaining() only generates LEAGUE fixtures (cap=14 per team)
+  - simulate_playoff() uses real results for already-completed playoff matches
+  - simulate_one() only counts league matches for standings
+  - play_or_lookup() prevents re-simulating real playoff outcomes
 
 Usage:
     python simulate/simulate.py
@@ -18,12 +20,14 @@ import argparse
 import json
 import logging
 import sqlite3
+from collections import Counter, defaultdict
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import random
 
 import sys
 sys.path.insert(0, str(Path(".").resolve()))
@@ -36,7 +40,6 @@ DB_PATH  = Path("ipl.db")
 N_SIMS   = 10_000
 SEASON   = "2026"
 
-# All 10 IPL 2026 teams — used as ground truth for schedule generation
 IPL_2026_TEAMS = [
     "Mumbai Indians",
     "Chennai Super Kings",
@@ -50,11 +53,19 @@ IPL_2026_TEAMS = [
     "Lucknow Super Giants",
 ]
 
-# Each pair plays twice → 10C2 * 2 = 90 group matches
-# IPL actual group stage = 70 (each team plays 14), not full round-robin
-# We approximate: each pair plays once = 45 matches, close to real schedule
-# Adjust GROUP_MATCHES to match the actual 2026 format once known
-GROUP_MATCHES_TOTAL = 70   # standard IPL group stage
+# Playoff stage labels — must match what scraper stores after the fix
+PLAYOFF_STAGES = {"Qualifier 1", "Qualifier 2", "Eliminator", "Final"}
+
+# Fixed bracket: match_no → stage
+IPL_2026_PLAYOFF_MAP = {
+    71: "Qualifier 1",
+    72: "Eliminator",
+    73: "Qualifier 2",
+    74: "Final",
+}
+
+GROUP_MATCHES_TOTAL = 70   # matches 1–70 are league stage
+MATCHES_PER_TEAM    = 14   # each team plays 14 league matches
 
 
 # ─── SCHEMA ──────────────────────────────────────────────────────────────────
@@ -71,17 +82,34 @@ CREATE TABLE IF NOT EXISTS simulation_results (
 """
 
 
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+def is_playoff_match(row) -> bool:
+    """True if this match is a playoff match (not a league match)."""
+    stage = str(row.get("stage") or "").strip()
+    # Also catch by match number in case stage wasn't set correctly
+    try:
+        match_no = int(row.get("event_match_no") or 0)
+        if match_no >= 71:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return stage in PLAYOFF_STAGES
+
+
 # ─── LOAD COMPLETED 2026 MATCHES ─────────────────────────────────────────────
 
-def load_completed(conn: sqlite3.Connection) -> pd.DataFrame:
+def load_completed(conn: sqlite3.Connection) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Load ALL played matches for IPL 2026:
-    - includes wins/losses
-    - includes no result / abandoned matches
-    """
+    Load all played 2026 matches and split into:
+      - league_completed  : matches 1–70 (used for standings)
+      - playoff_completed : matches 71–74 (used to short-circuit bracket)
 
+    Returns (league_completed, playoff_completed)
+    """
     df = pd.read_sql("""
-        SELECT match_id, date, team1, team2, winner, venue, stage, result, method
+        SELECT match_id, date, team1, team2, winner, venue,
+               stage, result, method, event_match_no
         FROM matches
         WHERE season = '2026'
         AND (
@@ -92,46 +120,56 @@ def load_completed(conn: sqlite3.Connection) -> pd.DataFrame:
         ORDER BY date ASC, match_id ASC
     """, conn)
 
-    log.info(f"Completed (including NR) 2026 matches in DB: {len(df)}")
-    return df
+    # Split
+    league_mask  = ~df.apply(is_playoff_match, axis=1)
+    league_done  = df[league_mask].copy().reset_index(drop=True)
+    playoff_done = df[~league_mask].copy().reset_index(drop=True)
+
+    log.info(f"Completed league matches  : {len(league_done)}")
+    log.info(f"Completed playoff matches : {len(playoff_done)}")
+
+    if not playoff_done.empty:
+        for _, r in playoff_done.iterrows():
+            log.info(f"  [{r['stage']}] {r['team1']} vs {r['team2']} → winner={r['winner']}")
+
+    return league_done, playoff_done
 
 
-# ─── BUILD REMAINING FIXTURE LIST ────────────────────────────────────────────
+# ─── BUILD REMAINING LEAGUE FIXTURES ─────────────────────────────────────────
 
-def build_remaining(completed: pd.DataFrame) -> pd.DataFrame:
+def build_remaining(league_completed: pd.DataFrame) -> pd.DataFrame:
     """
-    Generate remaining fixtures ensuring:
-    - Each team ends with exactly 14 matches
-    - Each pair plays at most twice
-    - Total schedule remains consistent
+    Generate remaining LEAGUE fixtures only (no playoffs — bracket handles those).
+    Ensures each team ends with exactly MATCHES_PER_TEAM=14 league matches.
     """
 
-    from collections import Counter, defaultdict
-    from itertools import combinations
-    import random
-    import pandas as pd
-
-    MATCHES_PER_TEAM = 14
-
-    # ─── STEP 1: Count played matches ───
+    # Count played league matches per team and per pair
     team_played = defaultdict(int)
     pair_counts = Counter()
 
-    for _, r in completed.iterrows():
+    for _, r in league_completed.iterrows():
         t1, t2 = r["team1"], r["team2"]
-
-        # COUNT ALL matches (including NR)
         team_played[t1] += 1
         team_played[t2] += 1
         pair_counts[tuple(sorted([t1, t2]))] += 1
 
-    # ─── STEP 2: Remaining matches per team ───
+    # Remaining league matches per team
     team_remaining = {
         t: max(0, MATCHES_PER_TEAM - team_played[t])
         for t in IPL_2026_TEAMS
     }
 
-    # ─── STEP 3: Generate fixtures (greedy) ───
+    # Log current state
+    log.info("League match counts per team:")
+    for t in sorted(IPL_2026_TEAMS):
+        log.info(f"  {t:<35} played={team_played[t]:2d}  remaining={team_remaining[t]:2d}")
+
+    # If all teams have played 14, group stage is complete
+    if all(v == 0 for v in team_remaining.values()):
+        log.info("Group stage complete — no league fixtures to simulate.")
+        return pd.DataFrame(columns=["match_id", "date", "team1", "team2", "winner", "venue", "stage"])
+
+    # Greedy fixture generation
     all_pairs = list(combinations(IPL_2026_TEAMS, 2))
     random.seed(42)
     random.shuffle(all_pairs)
@@ -142,23 +180,20 @@ def build_remaining(completed: pd.DataFrame) -> pd.DataFrame:
     for t1, t2 in all_pairs:
         pair = tuple(sorted([t1, t2]))
         already_played = pair_counts.get(pair, 0)
-        max_pair_plays = 2
-
         games_to_add = min(
-            max_pair_plays - already_played,
+            2 - already_played,          # each pair plays max 2 times
             team_remaining[t1],
             team_remaining[t2],
         )
-
         for _ in range(max(0, games_to_add)):
             fixtures.append({
                 "match_id": f"2026_gen_{idx:04d}",
-                "date": "2026-05-01",
-                "team1": t1,
-                "team2": t2,
-                "winner": None,
-                "venue": None,
-                "stage": "Unknown",
+                "date":     "2026-05-01",
+                "team1":    t1,
+                "team2":    t2,
+                "winner":   None,
+                "venue":    None,
+                "stage":    "League",
             })
             team_remaining[t1] -= 1
             team_remaining[t2] -= 1
@@ -166,7 +201,7 @@ def build_remaining(completed: pd.DataFrame) -> pd.DataFrame:
 
     remaining = pd.DataFrame(fixtures)
 
-    # ─── STEP 4: REPAIR (CRITICAL FIX) ───
+    # ─── REPAIR: fill any deficit from greedy not filling all slots ───
     team_sim = defaultdict(int)
     for _, r in remaining.iterrows():
         team_sim[r["team1"]] += 1
@@ -180,47 +215,37 @@ def build_remaining(completed: pd.DataFrame) -> pd.DataFrame:
 
     if deficit:
         log.warning(f"Repairing incomplete schedule: {deficit}")
-
-        teams = list(deficit.keys())
-
-        for i in range(len(teams)):
-            for j in range(i + 1, len(teams)):
-                t1, t2 = teams[i], teams[j]
-
+        teams_with_deficit = list(deficit.keys())
+        for i in range(len(teams_with_deficit)):
+            for j in range(i + 1, len(teams_with_deficit)):
+                t1, t2 = teams_with_deficit[i], teams_with_deficit[j]
                 pair = tuple(sorted([t1, t2]))
-                if pair_counts[pair] >= 2:
-                    continue
-
-                while deficit[t1] > 0 and deficit[t2] > 0:
-                    remaining = pd.concat([
-                        remaining,
-                        pd.DataFrame([{
-                            "match_id": f"2026_fix_{idx:04d}",
-                            "date": "2026-05-01",
-                            "team1": t1,
-                            "team2": t2,
-                            "winner": None,
-                            "venue": None,
-                            "stage": "Unknown",
-                        }])
-                    ], ignore_index=True)
-
+                while deficit.get(t1, 0) > 0 and deficit.get(t2, 0) > 0:
+                    if pair_counts.get(pair, 0) >= 2:
+                        break
+                    remaining = pd.concat([remaining, pd.DataFrame([{
+                        "match_id": f"2026_fix_{idx:04d}",
+                        "date":     "2026-05-01",
+                        "team1":    t1,
+                        "team2":    t2,
+                        "winner":   None,
+                        "venue":    None,
+                        "stage":    "League",
+                    }])], ignore_index=True)
                     deficit[t1] -= 1
                     deficit[t2] -= 1
-                    pair_counts[pair] += 1
+                    pair_counts[pair] = pair_counts.get(pair, 0) + 1
                     idx += 1
 
-    # ─── STEP 5: FINAL LOGGING ───
-    log.info(f"Remaining group fixtures to simulate: {len(remaining)}")
-
-    team_sim = defaultdict(int)
+    # Final summary
+    log.info(f"Remaining league fixtures to simulate: {len(remaining)}")
+    team_sim_final = defaultdict(int)
     for _, r in remaining.iterrows():
-        team_sim[r["team1"]] += 1
-        team_sim[r["team2"]] += 1
-
+        team_sim_final[r["team1"]] += 1
+        team_sim_final[r["team2"]] += 1
     for t in sorted(IPL_2026_TEAMS):
-        total = team_played[t] + team_sim[t]
-        log.info(f"  {t:<35} played={team_played[t]:2d}  simulated={team_sim[t]:2d}  total={total}")
+        total = team_played[t] + team_sim_final[t]
+        log.info(f"  {t:<35} played={team_played[t]:2d}  simulated={team_sim_final[t]:2d}  total={total}")
 
     return remaining
 
@@ -229,6 +254,10 @@ def build_remaining(completed: pd.DataFrame) -> pd.DataFrame:
 
 def get_match_probs(remaining: pd.DataFrame, conn: sqlite3.Connection) -> pd.DataFrame:
     from model.predict import predict_match
+
+    if remaining.empty:
+        log.info("No remaining fixtures — skipping probability computation.")
+        return remaining
 
     log.info(f"Computing model probabilities for {len(remaining)} fixtures...")
 
@@ -249,94 +278,145 @@ def get_match_probs(remaining: pd.DataFrame, conn: sqlite3.Connection) -> pd.Dat
     return remaining
 
 
-# ─── PLAYOFF SIMULATOR ───────────────────────────────────────────────────────
+# ─── PLAYOFF BRACKET SIMULATOR ────────────────────────────────────────────────
 
-def simulate_playoff(ranked: list, prob_lookup: dict, rng: np.random.Generator) -> str:
+def play_or_lookup(
+    stage: str,
+    team_a: str,
+    team_b: str,
+    playoff_done: pd.DataFrame,
+    prob_lookup: dict,
+    rng: np.random.Generator,
+) -> tuple[str, str]:
+    """
+    If this playoff stage is already in DB with a real result, use it.
+    Otherwise simulate it using model probabilities.
+
+    Returns (winner, loser).
+    """
+    # Check if this stage has a real result
+    if not playoff_done.empty:
+        match = playoff_done[playoff_done["stage"] == stage]
+        if not match.empty:
+            real_winner = match.iloc[0]["winner"]
+            real_team1  = match.iloc[0]["team1"]
+            real_team2  = match.iloc[0]["team2"]
+            if pd.notna(real_winner):
+                real_loser = real_team2 if real_winner == real_team1 else real_team1
+                log.debug(f"[{stage}] Using real result: {real_winner} beat {real_loser}")
+                return real_winner, real_loser
+
+    # Not yet played — simulate
+    p = prob_lookup.get((team_a, team_b),
+        1.0 - prob_lookup.get((team_b, team_a), 0.5))
+    winner = team_a if rng.random() < p else team_b
+    loser  = team_b if winner == team_a else team_a
+    return winner, loser
+
+
+def simulate_playoff(
+    ranked: list,
+    playoff_done: pd.DataFrame,
+    prob_lookup: dict,
+    rng: np.random.Generator,
+) -> str:
     """
     IPL playoff bracket:
-      Q1:    #1 vs #2  → winner → Final
-      EL:    #3 vs #4  → loser eliminated
-      Q2:    Q1-loser vs EL-winner → winner → Final
+      Q1: #1 vs #2  → winner → Final directly
+      EL: #3 vs #4  → loser eliminated
+      Q2: Q1-loser vs EL-winner → winner → Final
       Final: Q1-winner vs Q2-winner → champion
-    """
-    def play(a, b):
-        p = prob_lookup.get((a, b), 1.0 - prob_lookup.get((b, a), 0.5))
-        return a if rng.random() < p else b
 
+    Uses real results for already-completed playoff matches.
+    """
     t1, t2, t3, t4 = ranked[0], ranked[1], ranked[2], ranked[3]
 
-    q1_win  = play(t1, t2)
-    q1_lose = t2 if q1_win == t1 else t1
-    el_win  = play(t3, t4)
-    q2_win  = play(q1_lose, el_win)
-    return play(q1_win, q2_win)
+    q1_win,  q1_lose = play_or_lookup("Qualifier 1", t1, t2, playoff_done, prob_lookup, rng)
+    el_win,  _       = play_or_lookup("Eliminator",  t3, t4, playoff_done, prob_lookup, rng)
+    q2_win,  _       = play_or_lookup("Qualifier 2", q1_lose, el_win, playoff_done, prob_lookup, rng)
+    champion, _      = play_or_lookup("Final",        q1_win, q2_win, playoff_done, prob_lookup, rng)
+
+    return champion
 
 
 # ─── SINGLE SEASON SIMULATION ────────────────────────────────────────────────
 
 def simulate_one(
-    completed: pd.DataFrame,
+    league_completed: pd.DataFrame,
     remaining: pd.DataFrame,
+    playoff_done: pd.DataFrame,
     all_teams: list,
     prob_lookup: dict,
     rng: np.random.Generator,
 ) -> str:
-    """Simulate one full season. Returns champion team name."""
+    """
+    Simulate one full season. Returns champion team name.
 
-    # Initialise win/played counters from real completed matches
+    League standings are computed from LEAGUE matches only.
+    Playoff bracket runs separately after standings are finalized.
+    """
+
+    # Init counters from real LEAGUE matches only
     wins   = {t: 0 for t in all_teams}
     played = {t: 0 for t in all_teams}
 
-    for _, r in completed.iterrows():
+    for _, r in league_completed.iterrows():
         t1, t2, w = r["team1"], r["team2"], r["winner"]
         if t1 in played: played[t1] += 1
         if t2 in played: played[t2] += 1
         if pd.notna(w) and w in wins:
             wins[w] += 1
 
-    # Sample remaining group matches
-    p_arr  = remaining["p_team1"].values
-    t1_arr = remaining["team1"].values
-    t2_arr = remaining["team2"].values
-    rolls  = rng.random(len(remaining))
+    # Simulate remaining LEAGUE matches
+    if not remaining.empty:
+        p_arr  = remaining["p_team1"].values
+        t1_arr = remaining["team1"].values
+        t2_arr = remaining["team2"].values
+        rolls  = rng.random(len(remaining))
 
-    for i in range(len(remaining)):
-        t1, t2 = t1_arr[i], t2_arr[i]
-        winner = t1 if rolls[i] < p_arr[i] else t2
-        if t1 in played: played[t1] += 1
-        if t2 in played: played[t2] += 1
-        if winner in wins: wins[winner] += 1
+        for i in range(len(remaining)):
+            t1, t2 = t1_arr[i], t2_arr[i]
+            winner = t1 if rolls[i] < p_arr[i] else t2
+            if t1 in played: played[t1] += 1
+            if t2 in played: played[t2] += 1
+            if winner in wins: wins[winner] += 1
 
-    # Sort by points (2 per win) then win-rate as NRR proxy
+    # Sort by points (2 per win) then win-rate as NRR proxy — LEAGUE only
     ranked = sorted(
         all_teams,
         key=lambda t: (wins[t] * 2, wins[t] / max(played[t], 1)),
         reverse=True
     )
 
-    return simulate_playoff(ranked, prob_lookup, rng)
+    # Run playoff bracket (top 4 only)
+    return simulate_playoff(ranked, playoff_done, prob_lookup, rng)
 
 
 # ─── MONTE CARLO RUNNER ───────────────────────────────────────────────────────
 
 def run_monte_carlo(
-    completed: pd.DataFrame,
+    league_completed: pd.DataFrame,
     remaining: pd.DataFrame,
+    playoff_done: pd.DataFrame,
     all_teams: list,
     n: int = N_SIMS,
 ) -> dict:
     rng = np.random.default_rng(seed=42)
 
-    # Pre-build probability lookup dict for O(1) access inside the loop
+    # Pre-build probability lookup for O(1) access in simulation loop
     prob_lookup = {}
-    for _, r in remaining.iterrows():
-        prob_lookup[(r["team1"], r["team2"])] = r["p_team1"]
+    if not remaining.empty:
+        for _, r in remaining.iterrows():
+            prob_lookup[(r["team1"], r["team2"])] = r["p_team1"]
 
     win_counts = {t: 0 for t in all_teams}
 
     log.info(f"Running {n:,} simulations...")
     for i in range(n):
-        champion = simulate_one(completed, remaining, all_teams, prob_lookup, rng)
+        champion = simulate_one(
+            league_completed, remaining, playoff_done,
+            all_teams, prob_lookup, rng
+        )
         if champion in win_counts:
             win_counts[champion] += 1
         if (i + 1) % 2000 == 0:
@@ -348,23 +428,29 @@ def run_monte_carlo(
 
 # ─── SAVE + DISPLAY ──────────────────────────────────────────────────────────
 
-def save_results(probs, n, n_completed, n_remaining, conn):
+def save_results(probs, n, n_league_completed, n_remaining, n_playoff_done, conn):
     conn.executescript(RESULTS_SCHEMA)
     conn.commit()
     run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    matches_played    = n_league_completed + n_playoff_done
+    matches_remaining = n_remaining + (4 - n_playoff_done)  # remaining league + remaining playoffs
     conn.execute(
         "INSERT INTO simulation_results VALUES (?,?,?,?,?,?)",
-        (run_id, datetime.utcnow().isoformat(), n, n_completed, n_remaining, json.dumps(probs))
+        (run_id, datetime.utcnow().isoformat(), n,
+         matches_played, matches_remaining, json.dumps(probs))
     )
     conn.commit()
     log.info(f"Saved → run_id: {run_id}")
     return run_id
 
 
-def display(probs, n_completed, n_remaining):
+def display(probs, n_league_completed, n_remaining, n_playoff_done):
+    total_played = n_league_completed + n_playoff_done
+    total_remaining = n_remaining + (4 - n_playoff_done)
     log.info("\n" + "=" * 58)
     log.info("  IPL 2026 TOURNAMENT WIN PROBABILITIES")
-    log.info(f"  {n_completed} matches played  |  {n_remaining} remaining")
+    log.info(f"  League: {n_league_completed}/70  |  Playoffs: {n_playoff_done}/4")
+    log.info(f"  Total played: {total_played}  |  Remaining: {total_remaining}")
     log.info("=" * 58)
     for i, (team, p) in enumerate(probs.items(), 1):
         bar = "█" * int(p * 40)
@@ -382,14 +468,27 @@ def main():
 
     conn = sqlite3.connect(args.db)
     try:
-        completed = load_completed(conn)
-        remaining = build_remaining(completed)
+        # Split completed matches into league vs playoff
+        league_completed, playoff_done = load_completed(conn)
+
+        # Build remaining LEAGUE fixtures only
+        remaining = build_remaining(league_completed)
+
+        # Get model probabilities for remaining league fixtures
         remaining = get_match_probs(remaining, conn)
 
-        probs = run_monte_carlo(completed, remaining, IPL_2026_TEAMS, n=args.n)
+        # Run Monte Carlo
+        probs = run_monte_carlo(
+            league_completed, remaining, playoff_done,
+            IPL_2026_TEAMS, n=args.n
+        )
 
-        save_results(probs, args.n, len(completed), len(remaining), conn)
-        display(probs, len(completed), len(remaining))
+        save_results(
+            probs, args.n,
+            len(league_completed), len(remaining), len(playoff_done),
+            conn
+        )
+        display(probs, len(league_completed), len(remaining), len(playoff_done))
 
     finally:
         conn.close()
