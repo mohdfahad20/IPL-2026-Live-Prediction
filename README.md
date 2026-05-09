@@ -32,18 +32,19 @@ A production-grade machine learning system that predicts IPL 2026 match outcomes
 | **Tournament Simulation** | 10,000 Monte Carlo runs after every match to estimate each team's championship probability — playoff-aware from Q1 through the Final |
 | **Playoff Bracket Simulation** | Completed playoff matches (Q1, Eliminator, Q2, Final) use real results; unplayed stages are simulated |
 | **Probability Trends** | Track how each team's win probability evolved across the full season |
-| **Live Points Table** | Scraped from Cricbuzz with real NRR, falling back to DB computation |
+| **Live Points Table** | Scraped from Cricbuzz with real NRR; last-5 form (`W`/`L`/`N`) computed from match DB and merged in |
 | **Automated Pipeline** | Nightly GitHub Actions job scrapes, retrains, simulates, and deploys without manual intervention |
-| **Data Integrity Guards** | Three-layer validation prevents silent corruption from ever reaching the model or frontend |
+| **Data Integrity Guards** | Three-layer validation prevents silent corruption from reaching the model or frontend |
 
 ---
 
 ## Architecture
 
 ```
-GitHub Actions (nightly cron)
+GitHub Actions (nightly cron — 12 AM IST)
 │
-├── scrape → fix stages → validate → features → train → simulate → log
+├── scrape matches → fix stages → validate → features → train → simulate → log
+├── scrape standings (NRR from Cricbuzz) + compute form (from DB) → standings.json
 │
 └── artifacts.zip (ipl.db + models/ + standings.json)
           │
@@ -54,7 +55,6 @@ GitHub Actions (nightly cron)
 
 FastAPI Backend (Render)
 ├── POST /api/predict
-├── POST /api/toss
 ├── GET  /api/probabilities
 ├── GET  /api/probabilities/history
 ├── GET  /api/standings
@@ -64,12 +64,11 @@ FastAPI Backend (Render)
           │
           │ HTTP JSON
           ▼
-Streamlit Frontend
-├── Win Probabilities tab
-├── Points Table tab
-├── Probability Trends tab
-├── Match Predictor tab
-└── Live Toss Predictor tab
+Streamlit Frontend (4 tabs)
+├── 🏆 Win Probabilities
+├── 📋 Points Table
+├── 📈 Probability Trends
+└── 🔮 Match Predictor
 ```
 
 ---
@@ -85,7 +84,7 @@ Streamlit Frontend
 | Data Scraping | cricdata (CricinfoClient), BeautifulSoup, Requests |
 | Feature Engineering | Pandas, NumPy |
 | Frontend | Streamlit, Plotly |
-| CI/CD | GitHub Actions |
+| CI/CD | GitHub Actions (single nightly cron) |
 | Deployment | Render (backend), Streamlit Cloud (frontend) |
 | Artifact Storage | GitHub Releases (versioned, automatic rollback) |
 
@@ -95,11 +94,11 @@ Streamlit Frontend
 
 ### 1. Data Ingestion
 
-Historical IPL data (2008–2025) is loaded from a Kaggle ball-by-ball dataset into SQLite. 2026 match results are scraped nightly from Cricinfo via the `cricdata` library. Each match is assigned the correct stage label (`League`, `Qualifier 1`, `Eliminator`, `Qualifier 2`, `Final`) based on its match number.
+Historical IPL data (2008–2025) is loaded from a Kaggle ball-by-ball dataset into SQLite. 2026 match results are scraped nightly from Cricinfo via the `cricdata` library. Each match is assigned the correct stage label (`League`, `Qualifier 1`, `Eliminator`, `Qualifier 2`, `Final`) based on its match number — cricdata's raw status values (`FINISHED`/`RUNNING`) are never stored.
 
 ### 2. Feature Engineering (`features/features.py`)
 
-Computes per-match features before the match is played (no data leakage — uses only `df.iloc[:i]`):
+Computes 23 per-match features before the match is played (no data leakage — uses only `df.iloc[:i]`):
 
 | Feature | Description |
 |---|---|
@@ -122,20 +121,20 @@ Computes per-match features before the match is played (no data leakage — uses
 Trains three base models plus a soft voting ensemble:
 
 ```
-XGBoost           → strong on form + venue features
-Random Forest     → good on head-to-head patterns
-Logistic Reg      → calibrated probability baseline
-Soft Ensemble     → weighted average (XGB 45% / RF 30% / LR 25%)
+XGBoost           → strong on form + venue features        (45% weight)
+Random Forest     → good on head-to-head patterns          (30% weight)
+Logistic Reg      → calibrated probability baseline        (25% weight)
+Soft Ensemble     → weighted average of all three
 ```
 
-Models are saved as `.pkl` files. Feature column order is saved in `model_meta.json` for consistent inference. `SoftEnsemble` is defined at module level in `train.py` and imported at the top of `model_loader.py` to ensure pickle deserialization works regardless of entry point.
+Models are saved as `.pkl` files. Feature column order is saved in `model_meta.json` for consistent inference. `SoftEnsemble` is defined at module level in `train.py` and imported at the top of `model_loader.py` to ensure pickle deserialization works regardless of FastAPI's entry point.
 
 ### 4. Monte Carlo Simulation (`simulate/simulate.py`)
 
-Playoff-aware simulation — handles the full tournament lifecycle:
+Playoff-aware simulation handling the full tournament lifecycle:
 
 **Group stage (matches 1–70):**
-1. Separate completed matches into `league_completed` and `playoff_completed`
+1. Split completed matches into `league_completed` and `playoff_completed`
 2. Build remaining league fixtures — each team capped at exactly 14 league matches
 3. Run `predict_match()` to get win probabilities for each remaining fixture
 4. Simulate 10,000 seasons, sampling outcomes per fixture
@@ -149,11 +148,21 @@ Q2:    Q1-loser vs EL-winner → Final
 Final: Q1-winner vs Q2-winner → Champion
 ```
 
-For each bracket stage, `play_or_lookup()` checks if the match has already been played:
-- **Real result exists** → uses actual winner from DB (deterministic across all 10,000 runs)
+`play_or_lookup()` checks if each bracket stage has already been played:
+- **Real result exists in DB** → uses actual winner (deterministic across all 10,000 runs)
 - **Not yet played** → simulates using model probability
 
-This means once Q1 is played, all 10,000 simulations reflect the real Q1 outcome automatically.
+Once Q1 is played, all 10,000 simulations reflect the real Q1 outcome automatically. No code changes needed as each playoff match completes.
+
+### 5. Model Performance
+
+| Metric | Our model | Random baseline |
+|---|---|---|
+| Accuracy | ~0.57 | 0.50 |
+| AUC | ~0.59 | 0.50 |
+| Brier score | ~0.248 | 0.250 |
+
+IPL T20 is the most unpredictable cricket format. Any model above 0.60 AUC on unseen seasons is likely overfitting. The ensemble's primary value is better-calibrated probabilities — 55% predictions should win ~55% of the time.
 
 ---
 
@@ -161,7 +170,7 @@ This means once Q1 is played, all 10,000 simulations reflect the real Q1 outcome
 
 ### `POST /api/predict`
 
-Match win prediction (pre-toss or post-toss).
+Match win prediction.
 
 **Request**
 ```json
@@ -191,10 +200,6 @@ Match win prediction (pre-toss or post-toss).
 }
 ```
 
-### `POST /api/toss`
-
-Pre vs post-toss probability comparison.
-
 ### `GET /api/probabilities`
 
 Latest Monte Carlo simulation results. `matches_played` reflects league + completed playoffs; `matches_remaining` reflects remaining league + unplayed playoff stages.
@@ -205,7 +210,7 @@ All historical simulation runs — used for probability trend charts.
 
 ### `GET /api/standings`
 
-Current IPL 2026 points table with NRR. Reads from `standings.json` (Cricbuzz) as primary, falls back to DB computation.
+Current IPL 2026 points table. NRR sourced from Cricbuzz scrape; Form (`WWLWL`) computed from match DB and merged before saving. Falls back to DB computation if scrape fails.
 
 ### `GET /api/recent-matches`
 
@@ -215,13 +220,13 @@ Last 8 completed matches.
 
 All historical venue-team combinations for dropdown population.
 
-> Interactive API docs available at `/docs` on the Render backend.
+> Interactive API docs: `https://ipl-predictor-api.onrender.com/docs`
 
 ---
 
 ## CI/CD Pipeline
 
-### Nightly Job (12 AM IST daily)
+### Nightly Job (12 AM IST daily — single cron)
 
 ```
 Download artifacts.zip from GitHub Release
@@ -236,43 +241,37 @@ DELETE 2026 matches (prevents Kaggle duplicates)
 Scrape fresh 2026 results from Cricinfo
           ↓
 Fix match stages
-  └─ League matches → 'League'
-  └─ Match 71 → 'Qualifier 1', 72 → 'Eliminator', 73 → 'Qualifier 2', 74 → 'Final'
+  └─ League matches  → 'League'
+  └─ Match 71        → 'Qualifier 1'
+  └─ Match 72        → 'Eliminator'
+  └─ Match 73        → 'Qualifier 2'
+  └─ Match 74        → 'Final'
           ↓
 GUARD 1: Abort if < 48 matches scraped
 GUARD 2: Abort if current count < previous count (regression)
 GUARD 3: Abort if bad stages / duplicate IDs / null teams / wrong playoff labels
           ↓
-Scrape standings from Cricbuzz
+Scrape standings from Cricbuzz (NRR) + compute form from DB → standings.json
           ↓
-Feature engineering → Model training → Simulation → Logging
+Feature engineering → Model training → Simulation (10,000 runs) → Logging
           ↓
 Package ipl.db + models/ + standings.json → Upload to GitHub Release
-  └─ Old release preserved until this step succeeds — automatic rollback point
+  └─ Old release preserved until this step — automatic rollback point
           ↓
-Trigger Render redeploy via deploy hook
+Trigger Render redeploy
           ↓
 Commit CSV logs to repo
 ```
 
-### Toss Job
-
-Runs during match windows to log live toss results:
-
-- **Weekdays:** 6:30–8:30 PM IST
-- **Weekends:** 2:30–8:30 PM IST
-
 ### Data Integrity Guards
-
-Three validation layers run before features/model/simulation:
 
 | Guard | What it checks | Action on failure |
 |---|---|---|
 | Scrape count floor | `>= 48` matches in DB | Abort — old artifacts preserved |
-| Count regression | Today's count `>=` yesterday's count | Abort — old artifacts preserved |
+| Count regression | Today's count `>=` yesterday's | Abort — old artifacts preserved |
 | Data quality | No bad stages, no duplicates, no null teams, no misassigned playoff labels | Abort — old artifacts preserved |
 
-GitHub Release is the automatic rollback point — it is only overwritten at the very end of a fully successful run.
+GitHub Release is the automatic rollback point — only overwritten at the end of a fully successful run.
 
 ---
 
@@ -281,7 +280,7 @@ GitHub Release is the automatic rollback point — it is only overwritten at the
 ```
 IPL-2026-Live-Prediction/
 ├── api/
-│   ├── main.py                    # FastAPI app, registers all routers
+│   ├── main.py                    # FastAPI app — predict, simulation, standings routers
 │   ├── startup.py                 # Downloads artifacts on cold start (3-retry)
 │   ├── core/
 │   │   ├── config.py              # Paths + env vars
@@ -289,12 +288,10 @@ IPL-2026-Live-Prediction/
 │   │   └── model_loader.py        # Loads + caches pkl models (SoftEnsemble fix)
 │   ├── routers/
 │   │   ├── predict.py             # POST /api/predict
-│   │   ├── toss.py                # POST /api/toss
-│   │   ├── simulation.py          # GET  /api/probabilities
+│   │   ├── simulation.py          # GET  /api/probabilities + /history
 │   │   └── standings.py           # GET  /api/standings + /recent-matches + /venues
 │   └── services/
 │       ├── prediction_service.py
-│       ├── toss_service.py
 │       ├── simulation_service.py
 │       └── standings_service.py
 ├── data/
@@ -313,9 +310,8 @@ IPL-2026-Live-Prediction/
 │   └── app_local.py               # Streamlit frontend (local DB mode)
 ├── .github/
 │   └── workflows/
-│       └── update_ipl_2026.yml    # Nightly pipeline + toss cron + 3 data guards
-├── scrape_standings.py            # Scrapes points table from Cricbuzz
-├── toss_scraper.py                # Scrapes live toss results
+│       └── update_ipl_2026.yml    # Single nightly pipeline + 3 data guards
+├── scrape_standings.py            # Scrapes NRR from Cricbuzz + merges form from DB
 ├── logger.py                      # Logs simulation results to DB
 ├── render.yaml                    # Render deployment config
 ├── requirements_pipeline.txt
@@ -347,7 +343,7 @@ python data/load_kaggle_data.py --csv data/IPL.csv --db ipl.db
 
 # Full pipeline
 python scraper/scrapper_data.py --db ipl.db
-python scrape_standings.py
+python scrape_standings.py --db ipl.db
 python features/features.py --db ipl.db
 python model/train.py --db ipl.db
 python -m simulate.simulate --db ipl.db --n 10000
@@ -381,6 +377,11 @@ import sqlite3; conn = sqlite3.connect('ipl.db')
 rows = conn.execute('SELECT run_id, run_at, matches_played, matches_remaining FROM simulation_results ORDER BY run_at DESC LIMIT 5').fetchall()
 [print(r) for r in rows]; conn.close()
 "
+
+# Restore from last good release if DB corrupted
+curl -L -o artifacts.zip \
+  https://github.com/mohdfahad20/IPL-2026-Live-Prediction/releases/download/latest-data/artifacts.zip
+unzip artifacts.zip
 ```
 
 ---
@@ -409,6 +410,7 @@ rows = conn.execute('SELECT run_id, run_at, matches_played, matches_remaining FR
 | Kaggle IPL ball-by-ball dataset (2008–2025) | Historical model training data |
 | Cricinfo via `cricdata` library | Live 2026 match results (match number → stage mapped automatically) |
 | Cricbuzz (HTML scrape + API fallback) | Live points table with accurate NRR |
+| `ipl.db` matches table | Last-5 form per team — merged into standings after scrape |
 
 ---
 
@@ -417,15 +419,19 @@ rows = conn.execute('SELECT run_id, run_at, matches_played, matches_remaining FR
 | Case | How it's handled |
 |---|---|
 | Super over matches | Multi-fallback winner extraction (winnerTeamId → superoverWinnerTeamId → statusText) |
-| No result / abandoned | 1 point each; excluded from model training target |
+| No result / abandoned | 1 point each; `N` in form string; excluded from model training target |
 | Kaggle + scraper overlap | 2026 data deleted before each scrape to prevent duplicates |
 | Wrong stage labels from cricdata | `get_ipl_stage()` maps match number → correct stage on every scrape |
+| Stage fix safety net | Workflow step converts any residual `FINISHED`/`RUNNING` → `League` after scrape |
 | Playoff teams exceeding 14 matches | Simulation splits league and playoff; 14-match cap applies to league only |
 | Already-played playoff matches | `play_or_lookup()` uses real results; unplayed stages are simulated |
+| Form missing from scraped standings | `compute_form()` reads `ipl.db` and merges into standings before saving |
+| NRR showing 0 | `result_margin` is NULL from cricdata — NRR sourced from Cricbuzz scrape instead |
 | Render cold start | `startup.py` downloads artifacts with 3-retry + exponential backoff |
 | Backend sleeping | Streamlit auto-retries with 5s wait and `st.rerun()` |
 | Partial or corrupt scrape | Three pipeline guards abort before model sees bad data; last good release preserved |
 | Silent count regression | Pipeline aborts if today's match count drops below yesterday's |
+| DB corrupted on production | Restore from GitHub Release: `curl` + `unzip artifacts.zip` |
 
 ---
 
