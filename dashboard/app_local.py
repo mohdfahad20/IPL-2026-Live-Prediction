@@ -1,12 +1,9 @@
 """
 IPL 2026 Prediction Dashboard — Cricket Green Theme (LOCAL MODE)
 """
-import csv
 import json
 import os
-import time
 import sqlite3
-from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
 
@@ -22,9 +19,8 @@ from model.train import SoftEnsemble  # noqa: F401 — required for pickle
 
 # ─── PATHS ────────────────────────────────────────────────────────────────────
 
-DB_PATH         = sys_path_root / "ipl.db"
-STANDINGS_PATH  = sys_path_root / "standings.json"
-MODELS_DIR      = sys_path_root / "models"
+DB_PATH        = sys_path_root / "ipl.db"
+STANDINGS_PATH = sys_path_root / "standings.json"
 
 # ─── TEAM CONFIG ──────────────────────────────────────────────────────────────
 
@@ -136,15 +132,6 @@ h1,h2,h3 { font-family: 'Teko', sans-serif; letter-spacing: 0.04em; color: #1a2e
     letter-spacing: 0.1em !important; text-transform: uppercase !important; color: #4a6a4a !important;
 }
 
-div[role="radiogroup"] label {
-    background: none !important; border: none !important;
-    box-shadow: none !important; padding: 2px 10px 2px 4px !important;
-}
-div[role="radiogroup"] label > div:last-child { background: none !important; border: none !important; box-shadow: none !important; }
-div[role="radiogroup"] label p { color: #1a2e1a !important; font-weight: 500 !important; }
-div[role="radiogroup"] label[aria-checked="true"] p { color: #1a5c1a !important; font-weight: 700 !important; }
-div[role="radiogroup"] label[aria-checked="true"] { background: none !important; border: none !important; box-shadow: none !important; }
-
 button[data-baseweb="tab"] { color: #1a3320 !important; font-family: "Source Sans 3", sans-serif !important; font-weight: 600 !important; font-size: 0.85rem !important; }
 button[data-baseweb="tab"]:hover { color: #2d7a2d !important; }
 button[data-baseweb="tab"][aria-selected="true"] { color: #1a5c1a !important; border-bottom-color: #2d7a2d !important; }
@@ -162,12 +149,6 @@ header[data-testid="stHeader"] {
 header[data-testid="stHeader"] * { color: #1a2e1a !important; }
 header[data-testid="stHeader"] button { color: #1a2e1a !important; background: transparent !important; }
 header[data-testid="stHeader"] svg { fill: #1a2e1a !important; color: #1a2e1a !important; }
-
-.stRadio > label {
-    color: #4a6a4a !important; font-size: 0.8rem !important;
-    font-weight: 600 !important; letter-spacing: 0.1em !important; text-transform: uppercase !important;
-}
-.stRadio > div { background: transparent !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -203,7 +184,6 @@ def load_sim_results():
 @st.cache_data(ttl=60)
 def load_points_table():
     try:
-        # Primary: standings.json (has real NRR from scraper)
         if STANDINGS_PATH.exists():
             data = json.loads(STANDINGS_PATH.read_text())
             rows = data.get("standings", [])
@@ -214,7 +194,6 @@ def load_points_table():
                 df.index += 1
                 return df
 
-        # Fallback: compute from DB
         conn    = sqlite3.connect(DB_PATH)
         matches = pd.read_sql("""
             SELECT team1, team2, winner, result, result_margin, date
@@ -225,24 +204,24 @@ def load_points_table():
         """, conn)
         conn.close()
 
-        stats = defaultdict(lambda: {"P":0,"W":0,"L":0,"NR":0,"Pts":0,"nrr_sum":0.0,"form":[]})
+        stats = defaultdict(lambda: {"P":0,"W":0,"L":0,"NR":0,"Pts":0})
         for _, r in matches.iterrows():
             t1, t2 = r["team1"], r["team2"]
             w      = r["winner"]
             result = (r.get("result") or "").lower()
-            if result in ("no result","abandoned") or (pd.isna(w) and "tie" not in result):
-                for t in [t1,t2]:
-                    stats[t]["P"]+=1; stats[t]["NR"]+=1; stats[t]["Pts"]+=1
+            if result in ("no result", "abandoned") or (pd.isna(w) and "tie" not in result):
+                for t in [t1, t2]:
+                    stats[t]["P"] += 1; stats[t]["NR"] += 1; stats[t]["Pts"] += 1
                 continue
-            loser = t2 if w==t1 else t1
-            for t in [t1,t2]: stats[t]["P"]+=1
-            stats[w]["W"]+=1; stats[w]["Pts"]+=2; stats[loser]["L"]+=1
+            loser = t2 if w == t1 else t1
+            for t in [t1, t2]: stats[t]["P"] += 1
+            stats[w]["W"] += 1; stats[w]["Pts"] += 2; stats[loser]["L"] += 1
 
         rows = []
         for team, s in stats.items():
-            rows.append({"Team":team,"P":s["P"],"W":s["W"],"L":s["L"],
-                         "NR":s["NR"],"Pts":s["Pts"],"NRR":0.0,"Form":""})
-        df = pd.DataFrame(rows).sort_values(["Pts","NRR"], ascending=False).reset_index(drop=True)
+            rows.append({"Team": team, "P": s["P"], "W": s["W"], "L": s["L"],
+                         "NR": s["NR"], "Pts": s["Pts"], "NRR": 0.0})
+        df = pd.DataFrame(rows).sort_values(["Pts", "NRR"], ascending=False).reset_index(drop=True)
         df.index += 1
         return df
     except Exception as e:
@@ -291,14 +270,13 @@ def load_history():
         rows = conn.execute("""
             SELECT run_at, matches_played, results_json
             FROM simulation_results
-            WHERE matches_played <= 70
             ORDER BY run_at ASC
         """).fetchall()
         conn.close()
 
-        seen    = {}
+        seen = {}
         for row in rows:
-            seen[row[1]] = row  # deduplicate by matches_played
+            seen[row[1]] = row
 
         records = []
         for row in seen.values():
@@ -328,30 +306,6 @@ def run_prediction(team1, team2, venue, toss_winner, toss_decision):
         )
     finally:
         conn.close()
-
-
-def run_toss_prediction(team1, team2, venue, toss_winner, toss_decision):
-    from model.predict import predict_match
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        pre  = predict_match(team1=team1, team2=team2, season="2026",
-                             venue=venue or None, conn=conn)
-        post = predict_match(team1=team1, team2=team2, season="2026",
-                             venue=venue or None,
-                             toss_winner=toss_winner,
-                             toss_decision=toss_decision,
-                             conn=conn)
-    finally:
-        conn.close()
-
-    shift = round(post["p_team1_wins"] - pre["p_team1_wins"], 4)
-    return {
-        "pre_toss":      pre,
-        "post_toss":     post,
-        "toss_shift":    shift,
-        "impact":        "High" if abs(shift)>0.05 else "Moderate" if abs(shift)>0.02 else "Low",
-        "beneficiary":   team1 if shift > 0 else team2,
-    }
 
 
 # ─── HERO ─────────────────────────────────────────────────────────────────────
@@ -406,14 +360,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ─── TABS ─────────────────────────────────────────────────────────────────────
+# ─── TABS (4 tabs — toss removed) ────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "🏆  Win Probabilities",
     "📋  Points Table",
     "📈  Probability Trends",
     "🔮  Match Predictor",
-    "⚡  Live Toss Predictor",
 ])
 
 
@@ -556,13 +509,6 @@ with tab4:
     venue_sel = st.selectbox(venue_label, venue_options)
     venue     = None if venue_sel in ("Select venue...", "--- All venues ---") else venue_sel
 
-    st.markdown(
-        '<p style="color:#7a9a7a;font-size:0.8rem;margin-bottom:0.5rem">'
-        'Based on current season form, head-to-head record, and venue history. '
-        'For toss-adjusted prediction use the ⚡ Live Toss Predictor tab.</p>',
-        unsafe_allow_html=True,
-    )
-
     if st.button("Predict Match", use_container_width=True):
         if team1 == team2:
             st.error("Please select two different teams.")
@@ -622,132 +568,6 @@ with tab4:
                     )
                 except Exception as e:
                     st.error(f"Prediction failed: {e}")
-
-
-# ── TAB 5 ─────────────────────────────────────────────────────────────────────
-with tab5:
-    st.markdown('<div class="sec-head">Live Toss Predictor</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<p style="color:#4a6a4a;margin-bottom:1.2rem">'
-        'Toss just happened? Enter the details to get the updated win probability '
-        'accounting for toss advantage at this venue.</p>',
-        unsafe_allow_html=True,
-    )
-
-    teams_list_live = sorted(TEAM_COLORS.keys())
-    venue_map_live  = load_venue_map()
-
-    st.markdown(
-        '<div style="background:#e8f5e8;border:1px solid #b0d8b0;border-radius:8px;'
-        'padding:0.8rem 1rem;margin-bottom:1rem;color:#1a3320;font-size:0.85rem;font-weight:600">'
-        '🟢 Fill in toss details as soon as the toss is announced for the most accurate prediction.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    lc1, lc2 = st.columns(2)
-    with lc1:
-        live_team1 = st.selectbox("Team 1", teams_list_live, index=0, key="live_t1")
-    with lc2:
-        live_team2 = st.selectbox("Team 2", [t for t in teams_list_live if t != live_team1], index=0, key="live_t2")
-
-    lc3, lc4 = st.columns(2)
-    with lc3:
-        live_pair   = frozenset([live_team1, live_team2])
-        live_venues = venue_map_live.get(live_pair, [])
-        all_v       = sorted(set(v for vl in venue_map_live.values() for v in vl))
-        live_v_opts = (
-            ["Select venue..."] + live_venues + ["--- Other ---"] + [v for v in all_v if v not in live_venues]
-            if live_venues else ["Select venue..."] + all_v
-        )
-        live_venue_sel = st.selectbox(
-            f"Venue ({len(live_venues)} h2h matchups)" if live_venues else "Venue",
-            live_v_opts, key="live_venue",
-        )
-        live_venue = None if live_venue_sel in ("Select venue...", "--- Other ---") else live_venue_sel
-    with lc4:
-        live_toss_w = st.selectbox("Toss won by", [live_team1, live_team2], key="live_tw")
-
-    live_toss_d = st.radio("Elected to", ["bat", "field"], horizontal=True, key="live_td")
-
-    if st.button("Get Live Prediction", use_container_width=True, key="live_btn"):
-        if live_team1 == live_team2:
-            st.error("Select two different teams.")
-        else:
-            with st.spinner("Computing..."):
-                try:
-                    result  = run_toss_prediction(live_team1, live_team2, live_venue, live_toss_w, live_toss_d)
-                    pre     = result["pre_toss"]
-                    post    = result["post_toss"]
-                    pre_p1  = pre["p_team1_wins"]
-                    post_p1 = post["p_team1_wins"]
-                    shift   = result["toss_shift"]
-                    c1c     = TEAM_COLORS.get(live_team1, "#1a5c1a")
-                    c2c     = TEAM_COLORS.get(live_team2, "#00B4D8")
-                    t1s     = TEAM_SHORT.get(live_team1, "")
-                    t2s     = TEAM_SHORT.get(live_team2, "")
-
-                    col_pre, col_post = st.columns(2)
-                    with col_pre:
-                        st.markdown(
-                            f'<div class="card" style="text-align:center;border-top:3px solid #b0b0b0">'
-                            f'<div style="font-size:0.7rem;letter-spacing:0.2em;text-transform:uppercase;color:#7a9a7a;font-weight:600;margin-bottom:0.8rem">Pre-Toss</div>'
-                            f'<div style="display:flex;justify-content:space-around">'
-                            f'<div><div style="font-family:Teko,sans-serif;font-size:2.5rem;color:{c1c}">{pre_p1:.0%}</div>'
-                            f'<div style="font-size:0.8rem;color:#4a6a4a;font-weight:600">{t1s}</div></div>'
-                            f'<div style="font-family:Teko,sans-serif;font-size:1.2rem;color:#9ab09a;align-self:center">VS</div>'
-                            f'<div><div style="font-family:Teko,sans-serif;font-size:2.5rem;color:{c2c}">{pre["p_team2_wins"]:.0%}</div>'
-                            f'<div style="font-size:0.8rem;color:#4a6a4a;font-weight:600">{t2s}</div></div>'
-                            f'</div></div>',
-                            unsafe_allow_html=True,
-                        )
-                    with col_post:
-                        st.markdown(
-                            f'<div class="card" style="text-align:center;border-top:3px solid #2d7a2d">'
-                            f'<div style="font-size:0.7rem;letter-spacing:0.2em;text-transform:uppercase;color:#2d7a2d;font-weight:600;margin-bottom:0.8rem">After Toss</div>'
-                            f'<div style="display:flex;justify-content:space-around">'
-                            f'<div><div style="font-family:Teko,sans-serif;font-size:2.5rem;color:{c1c}">{post_p1:.0%}</div>'
-                            f'<div style="font-size:0.8rem;color:#4a6a4a;font-weight:600">{t1s}</div></div>'
-                            f'<div style="font-family:Teko,sans-serif;font-size:1.2rem;color:#9ab09a;align-self:center">VS</div>'
-                            f'<div><div style="font-family:Teko,sans-serif;font-size:2.5rem;color:{c2c}">{post["p_team2_wins"]:.0%}</div>'
-                            f'<div style="font-size:0.8rem;color:#4a6a4a;font-weight:600">{t2s}</div></div>'
-                            f'</div></div>',
-                            unsafe_allow_html=True,
-                        )
-
-                    toss_beneficiary = result["beneficiary"]
-                    toss_color       = TEAM_COLORS.get(toss_beneficiary, "#2d7a2d")
-                    shift_abs        = abs(shift)
-                    arrow            = "▲" if shift > 0 else "▼"
-
-                    st.markdown(
-                        f'<div class="card-sm" style="border-left:4px solid {toss_color};border-radius:0 8px 8px 0;margin-top:0.5rem">'
-                        f'<span style="color:{toss_color};font-weight:700">{toss_beneficiary}</span>'
-                        f'<span style="color:#4a6a4a"> benefited from the toss — probability shifted '
-                        f'<strong style="color:#1a5c1a">{arrow} {shift_abs:.1%}</strong> '
-                        f'({result["impact"]} toss impact at this venue)</span>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                    log_path     = "prediction_log.csv"
-                    write_header = not Path(log_path).exists()
-                    with open(log_path, "a", newline="") as f:
-                        w = csv.writer(f)
-                        if write_header:
-                            w.writerow(["timestamp","team1","team2","venue",
-                                        "toss_winner","toss_decision",
-                                        "pre_p1","post_p1","toss_shift"])
-                        w.writerow([
-                            datetime.utcnow().isoformat(),
-                            live_team1, live_team2, live_venue or "",
-                            live_toss_w, live_toss_d,
-                            round(pre_p1,4), round(post_p1,4), round(shift,4),
-                        ])
-                    st.caption("Prediction logged to prediction_log.csv")
-
-                except Exception as e:
-                    st.error(f"Toss prediction failed: {e}")
 
 
 # ─── FOOTER ───────────────────────────────────────────────────────────────────
