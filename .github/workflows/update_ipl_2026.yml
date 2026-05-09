@@ -33,6 +33,7 @@ jobs:
         run: pip install -r requirements_pipeline.txt
 
       # ── Download previous artifacts ─────────────────────────
+      # Also saves previous 2026 count for regression check later
       - name: Download existing artifacts
         run: |
           curl -f -L -o artifacts.zip \
@@ -43,16 +44,21 @@ jobs:
             unzip -o artifacts.zip
             rm artifacts.zip
             echo "Artifacts extracted"
-            python -c "
+            PREV=$(python -c "
           import sqlite3
           conn = sqlite3.connect('ipl.db')
           total = conn.execute('SELECT COUNT(*) FROM matches').fetchone()[0]
           s2026 = conn.execute(\"SELECT COUNT(*) FROM matches WHERE season='2026'\").fetchone()[0]
           conn.close()
-          print(f'DB loaded: {total} total matches, {s2026} in 2026')
-          "
+          print(f'DB loaded: {total} total matches, {s2026} in 2026', flush=True)
+          import sys; sys.stdout.flush()
+          print(s2026)
+          " | tail -1)
+            echo "PREV_2026_COUNT=$PREV" >> $GITHUB_ENV
+            echo "Previous 2026 count saved: $PREV"
           else
             echo "No artifacts found — fresh build"
+            echo "PREV_2026_COUNT=0" >> $GITHUB_ENV
           fi
 
       # ── Dataset download ────────────────────────────────────
@@ -89,8 +95,6 @@ jobs:
           fi
 
       # ── Clean 2026 data before fresh scrape ─────────────────
-      # Required because Kaggle CSV already contains some 2026
-      # matches — without this delete we get duplicates
       - name: Clean 2026 season data
         run: |
           python -c "
@@ -107,9 +111,44 @@ jobs:
       - name: Scrape matches
         run: python scraper/scrapper_data.py --db ipl.db
 
-      # ── Guard — abort if scrape looks incomplete ─────────────
-      # Prevents bad data from propagating to features/model/sim
-      # Threshold = 35 (safe floor for mid-season, currently at 40)
+      # ── Fix stages (idempotent — safe to run every time) ────
+      # New scraper already writes correct stages, but this step
+      # acts as a safety net for any edge cases
+      - name: Fix match stages
+        run: |
+          python -c "
+          import sqlite3
+          conn = sqlite3.connect('ipl.db')
+
+          conn.execute(\"\"\"
+              UPDATE matches
+              SET stage = 'League'
+              WHERE season = '2026'
+              AND stage IN ('FINISHED', 'RUNNING', 'Unknown', 'Group', '')
+          \"\"\")
+
+          playoff_map = {71: 'Qualifier 1', 72: 'Eliminator', 73: 'Qualifier 2', 74: 'Final'}
+          for match_no, stage_name in playoff_map.items():
+              conn.execute(\"\"\"
+                  UPDATE matches SET stage = ?
+                  WHERE season = '2026'
+                  AND CAST(event_match_no AS INTEGER) = ?
+              \"\"\", (stage_name, match_no))
+
+          conn.commit()
+
+          rows = conn.execute(\"\"\"
+              SELECT stage, COUNT(*) FROM matches
+              WHERE season='2026' GROUP BY stage ORDER BY stage
+          \"\"\").fetchall()
+          print('2026 stage breakdown after fix:')
+          for r in rows:
+              print(f'  {r[0]}: {r[1]}')
+          conn.close()
+          "
+
+      # ── Guard 1: Scrape count floor ─────────────────────────
+      # Raised from 35 → 48 (51 matches played, 48 = safe floor)
       - name: Verify scrape count
         run: |
           python -c "
@@ -118,9 +157,83 @@ jobs:
           cnt = conn.execute(\"SELECT COUNT(*) FROM matches WHERE season='2026'\").fetchone()[0]
           conn.close()
           print(f'2026 matches after scrape: {cnt}')
-          if cnt < 35:
-              raise SystemExit(f'ABORTING: only {cnt} matches scraped — scrape incomplete or cricinfo is down')
-          print(f'Scrape verified OK ({cnt} matches)')
+          if cnt < 48:
+              raise SystemExit(f'ABORTING: only {cnt} matches — scrape incomplete or cricinfo down')
+          print(f'Scrape count verified OK ({cnt} matches)')
+          "
+
+      # ── Guard 2: Count regression check ────────────────────
+      # Aborts if today has fewer matches than yesterday
+      # Prevents silent data loss from propagating
+      - name: Check match count regression
+        run: |
+          python -c "
+          import sqlite3, os
+          conn = sqlite3.connect('ipl.db')
+          current = conn.execute(\"SELECT COUNT(*) FROM matches WHERE season='2026'\").fetchone()[0]
+          conn.close()
+          prev = int(os.environ.get('PREV_2026_COUNT', '0'))
+          print(f'Previous count: {prev}  |  Current count: {current}')
+          if prev > 0 and current < prev - 1:
+              raise SystemExit(f'COUNT REGRESSION: had {prev} matches, now only {current} — aborting to preserve last good artifacts')
+          print('Count regression check passed')
+          "
+        env:
+          PREV_2026_COUNT: ${{ env.PREV_2026_COUNT }}
+
+      # ── Guard 3: Data quality validation ───────────────────
+      # Catches silent corruption before it reaches features/model
+      - name: Validate scraped data quality
+        run: |
+          python -c "
+          import sqlite3
+          conn = sqlite3.connect('ipl.db')
+          errors = []
+
+          # Check 1: No bad stage values leaked in
+          bad_stages = conn.execute(\"\"\"
+              SELECT COUNT(*) FROM matches
+              WHERE season='2026'
+              AND stage IN ('FINISHED', 'RUNNING', 'Unknown', 'Group')
+          \"\"\").fetchone()[0]
+          if bad_stages > 0:
+              errors.append(f'BAD STAGES: {bad_stages} rows with wrong stage values')
+
+          # Check 2: No duplicate match_ids
+          dupes = conn.execute(\"\"\"
+              SELECT match_id, COUNT(*) as cnt FROM matches
+              WHERE season='2026'
+              GROUP BY match_id HAVING cnt > 1
+          \"\"\").fetchall()
+          if dupes:
+              errors.append(f'DUPLICATES: {len(dupes)} duplicate match_ids — {dupes[:3]}')
+
+          # Check 3: No matches with null team names
+          nullteams = conn.execute(\"\"\"
+              SELECT COUNT(*) FROM matches
+              WHERE season='2026'
+              AND (team1 IS NULL OR team2 IS NULL)
+          \"\"\").fetchone()[0]
+          if nullteams > 0:
+              errors.append(f'NULL TEAMS: {nullteams} matches missing team names')
+
+          # Check 4: Playoff stages not assigned to wrong match numbers
+          wrong_playoffs = conn.execute(\"\"\"
+              SELECT match_id, event_match_no, stage FROM matches
+              WHERE season='2026'
+              AND stage IN ('Qualifier 1','Qualifier 2','Eliminator','Final')
+              AND CAST(event_match_no AS INTEGER) < 71
+          \"\"\").fetchall()
+          if wrong_playoffs:
+              errors.append(f'WRONG PLAYOFF STAGE on league match: {wrong_playoffs}')
+
+          conn.close()
+
+          if errors:
+              for e in errors:
+                  print(f'ERROR: {e}')
+              raise SystemExit('Data quality validation FAILED — aborting pipeline. Last good artifacts preserved on GitHub Release.')
+          print('All data quality checks passed')
           "
 
       # ── Scrape standings ────────────────────────────────────
@@ -173,9 +286,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add toss_predictions.csv winner_log.csv match_predictions_log.csv || true
-
           if ! git diff --cached --quiet; then
             git commit -m "auto update: logs [$(date -u)]"
             git push
@@ -187,7 +298,8 @@ jobs:
   # ════════════════════════════════════════════════════════════
   # JOB 2 — TOSS PREDICTION (runs during match windows)
   # Weekdays: 6:30 PM - 8:30 PM IST (1 PM - 3 PM UTC)
-  # Weekends: 1:30 PM - 3:30 PM IST + 6:30 PM - 8:30 PM IST
+  # Weekends: 2:30 PM - 8:30 PM IST (9 AM - 3 PM UTC)
+  # Midnight run covered by JOB 1 daily cron
   # ════════════════════════════════════════════════════════════
   toss_prediction:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule != '0 18 * * *'
@@ -207,7 +319,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements_pipeline.txt
 
-      # ── Download artifacts (need model for prediction) ───────
       - name: Download existing artifacts
         run: |
           curl -f -L -o artifacts.zip \
@@ -222,7 +333,6 @@ jobs:
             echo "No artifacts — toss predictor may fail without model"
           fi
 
-      # ── Dataset download ────────────────────────────────────
       - name: Install gdown
         run: pip install gdown
 
@@ -238,7 +348,6 @@ jobs:
             exit 1
           fi
 
-      # ── Initialize DB if missing ────────────────────────────
       - name: Initialize DB if missing
         run: |
           if [ ! -f "ipl.db" ]; then
@@ -254,18 +363,14 @@ jobs:
           "
           fi
 
-      # ── Run toss predictor ──────────────────────────────────
       - name: Run toss predictor
         run: python toss_scraper.py --db ipl.db
 
-      # ── Commit toss log ─────────────────────────────────────
       - name: Commit toss updates
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add toss_predictions.csv || true
-
           if ! git diff --cached --quiet; then
             git commit -m "auto update: toss [$(date -u)]"
             git push
