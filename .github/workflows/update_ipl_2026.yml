@@ -107,13 +107,17 @@ jobs:
       - name: Scrape matches
         run: python scraper/scrapper_data.py --db ipl.db
 
-      # ── Fix stages (idempotent — safe to run every time) ────
+      # ── Fix stages using objectId (idempotent safety net) ───
+      # New scraper already writes correct stages via objectId map.
+      # This step is a safety net in case any slipped through.
+      # Uses match_id (format: '2026_{objectId}') for exact matching.
       - name: Fix match stages
         run: |
           python -c "
           import sqlite3
           conn = sqlite3.connect('ipl.db')
 
+          # Fix any residual bad stage values → League
           conn.execute(\"\"\"
               UPDATE matches
               SET stage = 'League'
@@ -121,13 +125,18 @@ jobs:
               AND stage IN ('FINISHED', 'RUNNING', 'Unknown', 'Group', '')
           \"\"\")
 
-          playoff_map = {71: 'Qualifier 1', 72: 'Eliminator', 73: 'Qualifier 2', 74: 'Final'}
-          for match_no, stage_name in playoff_map.items():
+          # Fix playoff stages using match_id (objectId-based, since event_match_no is always None)
+          playoff_map = {
+              '2026_1535462': 'Qualifier 1',
+              '2026_1535463': 'Eliminator',
+              '2026_1535464': 'Qualifier 2',
+              '2026_1535465': 'Final',
+          }
+          for match_id, stage_name in playoff_map.items():
               conn.execute(\"\"\"
                   UPDATE matches SET stage = ?
-                  WHERE season = '2026'
-                  AND CAST(event_match_no AS INTEGER) = ?
-              \"\"\", (stage_name, match_no))
+                  WHERE season = '2026' AND match_id = ?
+              \"\"\", (stage_name, match_id))
 
           conn.commit()
 
@@ -142,7 +151,7 @@ jobs:
           "
 
       # ── Guard 1: Scrape count floor ─────────────────────────
-      # Raised from 35 → 48 (51 matches played, 48 = safe floor)
+      # 70 league + up to 4 playoffs = max 74. Floor = 68 (safe)
       - name: Verify scrape count
         run: |
           python -c "
@@ -151,7 +160,7 @@ jobs:
           cnt = conn.execute(\"SELECT COUNT(*) FROM matches WHERE season='2026'\").fetchone()[0]
           conn.close()
           print(f'2026 matches after scrape: {cnt}')
-          if cnt < 48:
+          if cnt < 68:
               raise SystemExit(f'ABORTING: only {cnt} matches — scrape incomplete or cricinfo down')
           print(f'Scrape count verified OK ({cnt} matches)')
           "
@@ -181,6 +190,7 @@ jobs:
           conn = sqlite3.connect('ipl.db')
           errors = []
 
+          # Check 1: No bad stage values
           bad_stages = conn.execute(\"\"\"
               SELECT COUNT(*) FROM matches
               WHERE season='2026'
@@ -189,6 +199,7 @@ jobs:
           if bad_stages > 0:
               errors.append(f'BAD STAGES: {bad_stages} rows with wrong stage values')
 
+          # Check 2: No duplicate match_ids
           dupes = conn.execute(\"\"\"
               SELECT match_id, COUNT(*) as cnt FROM matches
               WHERE season='2026'
@@ -197,6 +208,7 @@ jobs:
           if dupes:
               errors.append(f'DUPLICATES: {len(dupes)} duplicate match_ids — {dupes[:3]}')
 
+          # Check 3: No null team names
           nullteams = conn.execute(\"\"\"
               SELECT COUNT(*) FROM matches
               WHERE season='2026'
@@ -205,27 +217,30 @@ jobs:
           if nullteams > 0:
               errors.append(f'NULL TEAMS: {nullteams} matches missing team names')
 
-          wrong_playoffs = conn.execute(\"\"\"
-              SELECT match_id, event_match_no, stage FROM matches
-              WHERE season='2026'
-              AND stage IN ('Qualifier 1','Qualifier 2','Eliminator','Final')
-              AND CAST(event_match_no AS INTEGER) < 71
-          \"\"\").fetchall()
-          if wrong_playoffs:
-              errors.append(f'WRONG PLAYOFF STAGE on league match: {wrong_playoffs}')
+          # Check 4: Playoff match_ids have correct stages
+          playoff_checks = {
+              '2026_1535462': 'Qualifier 1',
+              '2026_1535463': 'Eliminator',
+              '2026_1535464': 'Qualifier 2',
+              '2026_1535465': 'Final',
+          }
+          for mid, expected_stage in playoff_checks.items():
+              row = conn.execute(\"SELECT stage FROM matches WHERE match_id=?\", (mid,)).fetchone()
+              if row and row[0] != expected_stage:
+                  errors.append(f'WRONG STAGE: {mid} has stage={row[0]}, expected={expected_stage}')
 
           conn.close()
 
           if errors:
               for e in errors:
                   print(f'ERROR: {e}')
-              raise SystemExit('Data quality validation FAILED — aborting pipeline. Last good artifacts preserved on GitHub Release.')
+              raise SystemExit('Data quality validation FAILED — aborting pipeline.')
           print('All data quality checks passed')
           "
 
       # ── Scrape standings ────────────────────────────────────
       - name: Scrape standings
-        run: python scrape_standings.py
+        run: python scrape_standings.py --db ipl.db
 
       # ── Feature engineering ─────────────────────────────────
       - name: Feature engineering
